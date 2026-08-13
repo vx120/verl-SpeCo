@@ -33,7 +33,6 @@ from verl.utils import tensordict_utils as tu
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 from verl_speco.integration.agent_loop_runtime import (
     SPECO_AGENT_LOOP_MANAGER_CLASS,
-    SPECO_TEACHER_SCORING_TIME_KEY,
     install_agent_loop_runtime_patch,
 )
 from verl_speco.integration.opd_cotrain import (
@@ -90,9 +89,6 @@ SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC = (
 )
 _SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY = "_speco_vllm_spec_decode_drafts"
 _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY = "_speco_vllm_spec_decode_accepted_tokens"
-_SPECO_TEACHER_SCORING_TOTAL_KEY = "_speco_teacher_scoring_total"
-_SPECO_TEACHER_SCORING_COUNT_KEY = "_speco_teacher_scoring_count"
-_SPECO_TEACHER_SCORING_MAX_KEY = "_speco_teacher_scoring_max"
 _SPECO_DRAFTER_TIMING_DEDUCTED_KEY = "_speco_drafter_timing_deducted_from_update_actor"
 _DRAFTER_TARGET_SYNC_MESH = "drafter_target_sync"
 
@@ -298,52 +294,24 @@ def _speco_vllm_spec_decode_stats_from_batch(batch: Any) -> dict[str, float]:
     }
 
 
-def _speco_rollout_metrics_from_stats(
+def _speco_vllm_spec_decode_metrics_from_stats(
     stats: dict[str, float],
 ) -> dict[str, float]:
-    metrics: dict[str, float] = {}
     drafts = float(stats.get(_SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY, 0.0) or 0.0)
-    if drafts > 0.0:
-        accepted_tokens = float(
-            stats.get(_SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY, 0.0) or 0.0
-        )
-        metrics[SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC] = (
-            1.0 + accepted_tokens / drafts
-        )
-    teacher_count = float(stats.get(_SPECO_TEACHER_SCORING_COUNT_KEY, 0.0) or 0.0)
-    if teacher_count > 0.0:
-        teacher_total = float(stats.get(_SPECO_TEACHER_SCORING_TOTAL_KEY, 0.0) or 0.0)
-        metrics["timing_s/teacher_scoring"] = float(
-            stats.get(_SPECO_TEACHER_SCORING_MAX_KEY, 0.0) or 0.0
-        )
-        metrics["timing_s/teacher_scoring_mean"] = teacher_total / teacher_count
-    return metrics
-
-
-def _speco_vllm_spec_decode_metrics_from_batch(batch: Any) -> dict[str, float]:
-    return _speco_rollout_metrics_from_stats(
-        _speco_vllm_spec_decode_stats_from_batch(batch)
+    if drafts <= 0.0:
+        return {}
+    accepted_tokens = float(
+        stats.get(_SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY, 0.0) or 0.0
     )
-
-
-def _speco_teacher_scoring_stats_from_batch(batch: Any) -> dict[str, float]:
-    non_tensor_batch = getattr(batch, "non_tensor_batch", None)
-    if not isinstance(non_tensor_batch, dict):
-        return {}
-    values = _speco_float_values(non_tensor_batch.get(SPECO_TEACHER_SCORING_TIME_KEY))
-    if not values:
-        return {}
     return {
-        _SPECO_TEACHER_SCORING_TOTAL_KEY: float(sum(values)),
-        _SPECO_TEACHER_SCORING_COUNT_KEY: float(len(values)),
-        _SPECO_TEACHER_SCORING_MAX_KEY: float(max(values)),
+        SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC: 1.0 + accepted_tokens / drafts
     }
 
 
-def _speco_rollout_stats_from_batch(batch: Any) -> dict[str, float]:
-    stats = _speco_vllm_spec_decode_stats_from_batch(batch)
-    stats.update(_speco_teacher_scoring_stats_from_batch(batch))
-    return stats
+def _speco_vllm_spec_decode_metrics_from_batch(batch: Any) -> dict[str, float]:
+    return _speco_vllm_spec_decode_metrics_from_stats(
+        _speco_vllm_spec_decode_stats_from_batch(batch)
+    )
 
 
 def _speco_truthy_meta_value(value: Any) -> bool:
@@ -396,7 +364,7 @@ def _speco_is_validation_generation(
     )
 
 
-def _speco_merge_rollout_stats(
+def _speco_merge_vllm_spec_decode_stats(
     existing: dict[str, float] | None,
     current: dict[str, float],
 ) -> dict[str, float]:
@@ -405,17 +373,11 @@ def _speco_merge_rollout_stats(
     totals = {
         _SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY: 0.0,
         _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY: 0.0,
-        _SPECO_TEACHER_SCORING_TOTAL_KEY: 0.0,
-        _SPECO_TEACHER_SCORING_COUNT_KEY: 0.0,
     }
     for key in totals:
         totals[key] = float((existing or {}).get(key, 0.0) or 0.0) + float(
             current.get(key, 0.0) or 0.0
         )
-    totals[_SPECO_TEACHER_SCORING_MAX_KEY] = max(
-        float((existing or {}).get(_SPECO_TEACHER_SCORING_MAX_KEY, 0.0) or 0.0),
-        float(current.get(_SPECO_TEACHER_SCORING_MAX_KEY, 0.0) or 0.0),
-    )
     return totals
 
 
@@ -2000,9 +1962,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if getattr(self, "_speco_last_rollout_metrics_step", None) != current_step:
             self._speco_last_rollout_metrics = {}
             self._speco_last_rollout_metrics_step = current_step
-        self._speco_last_rollout_metrics = _speco_merge_rollout_stats(
+        self._speco_last_rollout_metrics = _speco_merge_vllm_spec_decode_stats(
             getattr(self, "_speco_last_rollout_metrics", None),
-            _speco_rollout_stats_from_batch(output),
+            _speco_vllm_spec_decode_stats_from_batch(output),
         )
 
     def _speco_current_step_rollout_metrics(self) -> dict[str, float]:
@@ -2010,7 +1972,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self, "global_steps", None
         ):
             return {}
-        return _speco_rollout_metrics_from_stats(
+        return _speco_vllm_spec_decode_metrics_from_stats(
             getattr(self, "_speco_last_rollout_metrics", None) or {}
         )
 

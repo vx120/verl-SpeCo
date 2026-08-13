@@ -18,7 +18,6 @@ from __future__ import annotations
 import contextvars
 import inspect
 import logging
-import time
 import types
 from functools import wraps
 from typing import Any, cast
@@ -26,7 +25,6 @@ from typing import Any, cast
 logger = logging.getLogger(__file__)
 
 _PATCHED = False
-SPECO_TEACHER_SCORING_TIME_KEY = "speco_teacher_scoring_time_s"
 _DEFAULT_EXTRA_KEYS = {
     "turn_scores",
     "tool_rewards",
@@ -34,7 +32,6 @@ _DEFAULT_EXTRA_KEYS = {
     "max_global_steps",
     "extras",
     "drafter_sample",
-    SPECO_TEACHER_SCORING_TIME_KEY,
 }
 _CURRENT_GLOBAL_STEPS = contextvars.ContextVar(
     "speco_current_global_steps", default=None
@@ -162,36 +159,6 @@ def _speco_context_from_batch(batch: Any) -> tuple[Any, Any]:
 def _speco_reset_context(global_steps_token: Any, validate_token: Any) -> None:
     _CURRENT_VALIDATE.reset(validate_token)
     _CURRENT_GLOBAL_STEPS.reset(global_steps_token)
-
-
-async def _compute_teacher_logprobs_with_timing(
-    worker: Any,
-    compute_teacher_logprobs: Any,
-    output: Any,
-    prompt_ids: Any,
-    response_ids: Any,
-    validate: bool,
-    sample_kwargs: Any = None,
-) -> Any:
-    """Delegate unchanged to upstream while recording Teacher wall time."""
-
-    measure = bool(getattr(worker, "distillation_enabled", False)) and not validate
-    started = time.perf_counter() if measure else None
-    result = compute_teacher_logprobs(
-        worker,
-        output,
-        prompt_ids,
-        response_ids,
-        validate,
-        sample_kwargs,
-    )
-    if inspect.isawaitable(result):
-        result = await result
-    if started is not None:
-        extra_fields = getattr(output, "extra_fields", None)
-        if isinstance(extra_fields, dict):
-            extra_fields[SPECO_TEACHER_SCORING_TIME_KEY] = time.perf_counter() - started
-    return result
 
 
 def _speco_worker_init(self, *args, **kwargs):
@@ -429,7 +396,6 @@ def install_agent_loop_runtime_patch() -> bool:
     generate_sequences = getattr(worker_cls, "generate_sequences", None)
     run_agent_loop = getattr(worker_cls, "_run_agent_loop", None)
     agent_loop_postprocess = getattr(worker_cls, "_agent_loop_postprocess", None)
-    compute_teacher_logprobs = getattr(worker_cls, "_compute_teacher_logprobs", None)
     postprocess = getattr(worker_cls, "_postprocess", None)
     manager_init = getattr(manager_cls, "__init__", None)
     manager_generate_sequences = getattr(manager_cls, "generate_sequences", None)
@@ -528,32 +494,6 @@ def install_agent_loop_runtime_patch() -> bool:
 
         worker_cls._agent_loop_postprocess = speco_agent_loop_postprocess
         worker_cls._speco_patched_agent_loop_postprocess = True
-
-    if callable(compute_teacher_logprobs) and not getattr(
-        worker_cls, "_speco_patched_compute_teacher_logprobs", False
-    ):
-
-        @wraps(compute_teacher_logprobs)
-        async def speco_compute_teacher_logprobs(
-            self,
-            output,
-            prompt_ids,
-            response_ids,
-            validate,
-            sample_kwargs=None,
-        ):
-            return await _compute_teacher_logprobs_with_timing(
-                self,
-                compute_teacher_logprobs,
-                output,
-                prompt_ids,
-                response_ids,
-                validate,
-                sample_kwargs,
-            )
-
-        worker_cls._compute_teacher_logprobs = speco_compute_teacher_logprobs
-        worker_cls._speco_patched_compute_teacher_logprobs = True
 
     if not getattr(worker_cls, "_speco_patched_postprocess", False):
 
