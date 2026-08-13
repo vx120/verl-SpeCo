@@ -33,7 +33,12 @@ from verl.utils import tensordict_utils as tu
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 from verl_speco.integration.agent_loop_runtime import (
     SPECO_AGENT_LOOP_MANAGER_CLASS,
+    SPECO_TEACHER_SCORING_TIME_KEY,
     install_agent_loop_runtime_patch,
+)
+from verl_speco.integration.opd_cotrain import (
+    detach_student_feature,
+    student_policy_batch_keys,
 )
 from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
 from verl_speco.integration.oldlogprob_runtime import (
@@ -73,6 +78,7 @@ from verl_speco.integration.vllm_runtime import (
     configure_vllm_runtime_from_config,
 )
 from verl_speco.trainer.bubble_profiler import inject_bubble_metrics
+from verl_speco.trainer.drafter_lifecycle import SyncDrafterLifecycle
 from verl_speco.workers import SpecoWorker
 
 
@@ -84,6 +90,9 @@ SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC = (
 )
 _SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY = "_speco_vllm_spec_decode_drafts"
 _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY = "_speco_vllm_spec_decode_accepted_tokens"
+_SPECO_TEACHER_SCORING_TOTAL_KEY = "_speco_teacher_scoring_total"
+_SPECO_TEACHER_SCORING_COUNT_KEY = "_speco_teacher_scoring_count"
+_SPECO_TEACHER_SCORING_MAX_KEY = "_speco_teacher_scoring_max"
 _SPECO_DRAFTER_TIMING_DEDUCTED_KEY = "_speco_drafter_timing_deducted_from_update_actor"
 _DRAFTER_TARGET_SYNC_MESH = "drafter_target_sync"
 
@@ -99,10 +108,14 @@ _POLICY_MODEL_NON_TENSOR_KEYS = {"multi_modal_inputs", "pad_token_id"}
 
 def _select_policy_model_batch(batch: DataProto) -> DataProto:
     """Keep rollout/drafter side-channel data out of policy-model forward paths."""
+    batch_keys = student_policy_batch_keys(batch.batch.keys())
     non_tensor_batch_keys = [
         key for key in _POLICY_MODEL_NON_TENSOR_KEYS if key in batch.non_tensor_batch
     ]
-    return batch.select(non_tensor_batch_keys=non_tensor_batch_keys)
+    return batch.select(
+        batch_keys=batch_keys,
+        non_tensor_batch_keys=non_tensor_batch_keys,
+    )
 
 
 def _get_nested(config, path, default=None):
@@ -285,24 +298,52 @@ def _speco_vllm_spec_decode_stats_from_batch(batch: Any) -> dict[str, float]:
     }
 
 
-def _speco_vllm_spec_decode_metrics_from_stats(
+def _speco_rollout_metrics_from_stats(
     stats: dict[str, float],
 ) -> dict[str, float]:
+    metrics: dict[str, float] = {}
     drafts = float(stats.get(_SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY, 0.0) or 0.0)
-    if drafts <= 0.0:
-        return {}
-    accepted_tokens = float(
-        stats.get(_SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY, 0.0) or 0.0
-    )
-    return {
-        SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC: 1.0 + accepted_tokens / drafts
-    }
+    if drafts > 0.0:
+        accepted_tokens = float(
+            stats.get(_SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY, 0.0) or 0.0
+        )
+        metrics[SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC] = (
+            1.0 + accepted_tokens / drafts
+        )
+    teacher_count = float(stats.get(_SPECO_TEACHER_SCORING_COUNT_KEY, 0.0) or 0.0)
+    if teacher_count > 0.0:
+        teacher_total = float(stats.get(_SPECO_TEACHER_SCORING_TOTAL_KEY, 0.0) or 0.0)
+        metrics["timing_s/teacher_scoring"] = float(
+            stats.get(_SPECO_TEACHER_SCORING_MAX_KEY, 0.0) or 0.0
+        )
+        metrics["timing_s/teacher_scoring_mean"] = teacher_total / teacher_count
+    return metrics
 
 
 def _speco_vllm_spec_decode_metrics_from_batch(batch: Any) -> dict[str, float]:
-    return _speco_vllm_spec_decode_metrics_from_stats(
+    return _speco_rollout_metrics_from_stats(
         _speco_vllm_spec_decode_stats_from_batch(batch)
     )
+
+
+def _speco_teacher_scoring_stats_from_batch(batch: Any) -> dict[str, float]:
+    non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+    if not isinstance(non_tensor_batch, dict):
+        return {}
+    values = _speco_float_values(non_tensor_batch.get(SPECO_TEACHER_SCORING_TIME_KEY))
+    if not values:
+        return {}
+    return {
+        _SPECO_TEACHER_SCORING_TOTAL_KEY: float(sum(values)),
+        _SPECO_TEACHER_SCORING_COUNT_KEY: float(len(values)),
+        _SPECO_TEACHER_SCORING_MAX_KEY: float(max(values)),
+    }
+
+
+def _speco_rollout_stats_from_batch(batch: Any) -> dict[str, float]:
+    stats = _speco_vllm_spec_decode_stats_from_batch(batch)
+    stats.update(_speco_teacher_scoring_stats_from_batch(batch))
+    return stats
 
 
 def _speco_truthy_meta_value(value: Any) -> bool:
@@ -355,7 +396,7 @@ def _speco_is_validation_generation(
     )
 
 
-def _speco_merge_vllm_spec_decode_stats(
+def _speco_merge_rollout_stats(
     existing: dict[str, float] | None,
     current: dict[str, float],
 ) -> dict[str, float]:
@@ -364,11 +405,17 @@ def _speco_merge_vllm_spec_decode_stats(
     totals = {
         _SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY: 0.0,
         _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY: 0.0,
+        _SPECO_TEACHER_SCORING_TOTAL_KEY: 0.0,
+        _SPECO_TEACHER_SCORING_COUNT_KEY: 0.0,
     }
     for key in totals:
         totals[key] = float((existing or {}).get(key, 0.0) or 0.0) + float(
             current.get(key, 0.0) or 0.0
         )
+    totals[_SPECO_TEACHER_SCORING_MAX_KEY] = max(
+        float((existing or {}).get(_SPECO_TEACHER_SCORING_MAX_KEY, 0.0) or 0.0),
+        float(current.get(_SPECO_TEACHER_SCORING_MAX_KEY, 0.0) or 0.0),
+    )
     return totals
 
 
@@ -1424,7 +1471,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             elif hidden_ref is None:
                 if hidden is None:
                     continue
-                hidden = hidden[:valid_rows].contiguous()
+                hidden = detach_student_feature(hidden)[:valid_rows].contiguous()
                 if hidden.numel() == 0:
                     continue
                 collected_rows += int(hidden.size(0))
@@ -1460,7 +1507,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 sample["hidden_states_ref_chunks"] = ref_chunks
             elif hidden_ref is None:
                 hidden = cast(torch.Tensor, hidden)
-                sample["hidden_states"] = hidden.detach().cpu().unsqueeze(0)
+                sample["hidden_states"] = hidden.cpu().unsqueeze(0)
             else:
                 sample["hidden_states_ref"] = hidden_ref
                 sample["hidden_states_ref_meta"] = ref_meta
@@ -1953,9 +2000,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if getattr(self, "_speco_last_rollout_metrics_step", None) != current_step:
             self._speco_last_rollout_metrics = {}
             self._speco_last_rollout_metrics_step = current_step
-        self._speco_last_rollout_metrics = _speco_merge_vllm_spec_decode_stats(
+        self._speco_last_rollout_metrics = _speco_merge_rollout_stats(
             getattr(self, "_speco_last_rollout_metrics", None),
-            _speco_vllm_spec_decode_stats_from_batch(output),
+            _speco_rollout_stats_from_batch(output),
         )
 
     def _speco_current_step_rollout_metrics(self) -> dict[str, float]:
@@ -1963,7 +2010,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self, "global_steps", None
         ):
             return {}
-        return _speco_vllm_spec_decode_metrics_from_stats(
+        return _speco_rollout_metrics_from_stats(
             getattr(self, "_speco_last_rollout_metrics", None) or {}
         )
 
@@ -2112,11 +2159,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         defer_publish_until_update_weights = callable(
             original_checkpoint_update_weights
         )
-        pending_drafter_publish = {
-            "ready": False,
-            "drafter_trained": False,
-            "actor_output": None,
-        }
+        sync_drafter_lifecycle = SyncDrafterLifecycle(
+            defer_publish_until_rollout_weight_sync=defer_publish_until_update_weights,
+            publish_drafter=self._speco_publish_drafter_weights,
+            update_output_metrics=self._speco_update_output_metrics,
+        )
 
         def generate_sequences_with_speco(manager_self, *args, **kwargs):
             self._speco_wait_pending_drafter_publish()
@@ -2308,12 +2355,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     },
                 )
             metrics.update(train_metrics)
-            if defer_publish_until_update_weights and drafter_trained:
-                pending_drafter_publish["ready"] = True
-                pending_drafter_publish["drafter_trained"] = drafter_trained
-                pending_drafter_publish["actor_output"] = actor_output
-            else:
-                metrics.update(self._speco_publish_drafter_weights(drafter_trained))
+            metrics.update(
+                sync_drafter_lifecycle.after_student_update(
+                    actor_output=actor_output,
+                    drafter_trained=drafter_trained,
+                )
+            )
             metrics["timing_s/drafter"] = max(
                 0.0, time.perf_counter() - update_actor_started - actor_elapsed
             )
@@ -2336,16 +2383,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         def update_weights_with_speco(manager_self, *args, **kwargs):
             result = original_checkpoint_update_weights(*args, **kwargs)
-            if pending_drafter_publish["ready"]:
-                publish_metrics = self._speco_publish_drafter_weights(
-                    pending_drafter_publish["drafter_trained"]
-                )
-                self._speco_update_output_metrics(
-                    pending_drafter_publish["actor_output"], publish_metrics
-                )
-                pending_drafter_publish["ready"] = False
-                pending_drafter_publish["drafter_trained"] = False
-                pending_drafter_publish["actor_output"] = None
+            sync_drafter_lifecycle.after_student_rollout_weight_sync()
             return result
 
         rollout_generation_target.generate_sequences = MethodType(

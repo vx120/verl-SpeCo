@@ -45,6 +45,7 @@ from verl.utils.distributed import (
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
+from verl_speco.integration.opd_cotrain import ensure_student_only_feature_payload
 from verl_speco.trainer.feature_store import DraftFeatureSample, TorchShardFeatureStore
 
 logger = logging.getLogger(__file__)
@@ -764,6 +765,7 @@ class SpecoWorker(Worker):
         for sample in samples:
             if not sample:
                 continue
+            ensure_student_only_feature_payload(sample)
             batch = {
                 "input_ids": sample["input_ids"],
                 "prompts": sample["prompts"],
