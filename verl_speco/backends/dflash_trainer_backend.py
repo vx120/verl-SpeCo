@@ -25,10 +25,12 @@ from transformers import AutoConfig
 
 from verl.utils.device import get_device_id, get_device_name
 from verl_speco.backends.lr_scheduler import build_drafter_lr_scheduler
+from verl_speco.backends.optimizers import build_drafter_optimizer
 from verl_speco.models.dflash import (
     DFlashConfig,
     DFlashDraftModel,
     build_target_layer_ids,
+    resolve_rope_theta,
 )
 from verl_speco.models.dflash.flex_attention import compile_friendly_create_block_mask
 from verl_speco.models.target.target_head import TargetHead
@@ -50,16 +52,52 @@ class _SyncedTargetHead(nn.Module):
         return self.fc(hidden_states)
 
 
+def _block_acceptance_counts(
+    block_correct: torch.Tensor, block_scored: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Accepted draft tokens summed over blocks, and the number of scored blocks.
+
+    A greedy verifier takes a drafted block prefix and rejects everything from
+    the first mismatch onward, so position ``k`` only counts when ``0..k`` are
+    all correct. That is a prefix property, and it cannot be recovered from the
+    per-position marginal accuracies, which count each position independently.
+
+    Both arguments cover the **drafted** positions only, shaped
+    ``[bsz, n_blocks, n_drafted]``. Callers own that slicing because the block
+    layouts differ: DFlash keeps an unscored anchor at column 0 and must drop
+    it, while Domino and DSpark build shifted labels where every column is a
+    real prediction. Slicing inside here would silently discard their first
+    drafted token and, worse, stop a wrong first token from truncating the
+    block, which is the exact failure the metric exists to catch.
+
+    ``block_scored`` must be the same mask the correctness was computed under,
+    so that an unscored position reads as "no more prefix" rather than as a
+    mismatch. Unscored positions terminate the prefix, because nothing beyond
+    the supervised region can be counted as accepted.
+
+    Returned as a sum and a count rather than a mean so the two reduce correctly
+    across microbatches and across ranks. ``cumsum`` rather than ``cumprod``
+    because it is the more broadly supported primitive across backends.
+    """
+    broken = (~(block_correct & block_scored)).cumsum(dim=-1)
+    accepted = (broken == 0).sum(dim=-1)
+    return accepted.sum().float(), block_scored.any(dim=-1).sum().float()
+
+
 def _create_dflash_mask_mod(
     anchor_positions: torch.Tensor,
     block_keep_mask: torch.Tensor,
     ctx_len: int,
     block_size: int,
+    sliding_window: int | None = None,
+    document_ids: torch.Tensor | None = None,
 ):
     """Create DFlash block attention mask.
 
     A query block can attend to context tokens before its anchor and draft
-    tokens inside the same block. Different sampled blocks are isolated.
+    tokens inside the same block. Different sampled blocks are isolated. When
+    ``sliding_window`` is set, context attention is capped to that many tokens
+    before the anchor. ``document_ids`` additionally isolates packed documents.
     """
 
     def dflash_mask_mod(b, h, q_idx, kv_idx):
@@ -67,6 +105,20 @@ def _create_dflash_mask_mod(
         anchor_pos = anchor_positions[b, q_block_id]
         is_context = kv_idx < ctx_len
         mask_context = is_context & (kv_idx < anchor_pos)
+        if sliding_window is not None:
+            mask_context = mask_context & (kv_idx >= anchor_pos - sliding_window)
+        if document_ids is not None:
+            # document_ids covers the context only; draft keys never read it, so
+            # clamp the lookup to keep the draft half of KV in range.
+            kv_ctx_idx = (
+                min(kv_idx, ctx_len - 1)
+                if isinstance(kv_idx, int)
+                else kv_idx.clamp(max=ctx_len - 1)
+            )
+            doc = document_ids[b, kv_ctx_idx]
+            mask_context = (
+                mask_context & (doc >= 0) & (doc == document_ids[b, anchor_pos])
+            )
         is_draft = kv_idx >= ctx_len
         kv_block_id = (kv_idx - ctx_len) // block_size
         mask_draft = is_draft & (q_block_id == kv_block_id)
@@ -83,12 +135,15 @@ def _create_dflash_dense_attention_mask(
     block_keep_mask: torch.Tensor,
     ctx_len: int,
     block_size: int,
+    sliding_window: int | None = None,
+    document_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Build the dense equivalent of the DFlash/DSpark training block mask.
+    """Dense equivalent of :func:`_create_dflash_mask_mod` for SDPA devices.
 
-    PyTorch FlexAttention is currently used only on CUDA. Other devices use
-    SDPA and therefore need an explicit boolean mask with ``True`` entries for
-    keys that are visible to each draft query.
+    PyTorch FlexAttention is only used on CUDA, so other devices need an
+    explicit boolean mask with ``True`` entries for each visible key. See
+    :func:`_create_dflash_mask_mod` for the ``sliding_window``/``document_ids``
+    semantics.
     """
 
     bsz, num_blocks = anchor_positions.shape
@@ -102,6 +157,18 @@ def _create_dflash_dense_attention_mask(
 
     context_indices = torch.arange(ctx_len, device=device)
     context_allowed = context_indices.view(1, 1, ctx_len) < query_anchors.unsqueeze(-1)
+    if sliding_window is not None:
+        context_allowed = context_allowed & (
+            context_indices.view(1, 1, ctx_len)
+            >= (query_anchors - sliding_window).unsqueeze(-1)
+        )
+    if document_ids is not None:
+        query_docs = torch.gather(document_ids, 1, query_anchors)
+        context_allowed = (
+            context_allowed
+            & (document_ids.unsqueeze(1) == query_docs.unsqueeze(-1))
+            & (document_ids.unsqueeze(1) >= 0)
+        )
 
     draft_block_ids = torch.arange(draft_len, device=device) // block_size
     draft_allowed = (
@@ -118,6 +185,122 @@ def _create_dflash_dense_attention_mask(
     )
     allowed = torch.where(query_valid.unsqueeze(-1), allowed, safe_self)
     return allowed.unsqueeze(1)
+
+
+def _resolve_sliding_windows(config) -> list[int | None]:
+    """Return the per-layer sliding window (``None`` disables it for that layer)."""
+
+    num_layers = int(getattr(config, "num_hidden_layers", 1))
+    window = getattr(config, "sliding_window", None)
+    if not bool(getattr(config, "use_sliding_window", False)) or window is None:
+        return [None] * num_layers
+    window = int(window)
+    layer_types = getattr(config, "layer_types", None)
+    if not layer_types or len(layer_types) != num_layers:
+        return [window] * num_layers
+    return [
+        window if str(layer_type) == "sliding_attention" else None
+        for layer_type in layer_types
+    ]
+
+
+def _sliding_window_config(window, num_layers: int) -> dict:
+    """Draft-config kwargs for an all-sliding fallback backbone."""
+
+    if window is None:
+        return {}
+    return {
+        "sliding_window": int(window),
+        "use_sliding_window": True,
+        "layer_types": ["sliding_attention"] * int(num_layers),
+    }
+
+
+def build_dflash_attention_masks(
+    *,
+    anchor_positions: torch.Tensor,
+    block_keep_mask: torch.Tensor,
+    ctx_len: int,
+    block_size: int,
+    device: torch.device,
+    windows: list[int | None],
+    document_ids: torch.Tensor | None = None,
+):
+    """Build the attention masks shared by the DFlash-family training models.
+
+    Returns ``(block_mask, dense_attention_mask)``. When all layers share one
+    window the two entries are single mask objects; mixed layer types yield
+    per-layer lists so :meth:`DFlashDraftModel.forward` can index them.
+    """
+    bsz, num_blocks = anchor_positions.shape
+    draft_len = num_blocks * block_size
+
+    def build(window: int | None):
+        if device.type == "cuda":
+            block_mask = compile_friendly_create_block_mask(
+                mask_mod=_create_dflash_mask_mod(
+                    anchor_positions,
+                    block_keep_mask,
+                    ctx_len,
+                    block_size,
+                    sliding_window=window,
+                    document_ids=document_ids,
+                ),
+                B=bsz,
+                H=None,
+                Q_LEN=draft_len,
+                KV_LEN=ctx_len + draft_len,
+                device=device,
+            )
+            return block_mask, None
+        dense_mask = _create_dflash_dense_attention_mask(
+            anchor_positions,
+            block_keep_mask,
+            ctx_len,
+            block_size,
+            sliding_window=window,
+            document_ids=document_ids,
+        )
+        return None, dense_mask
+
+    unique_windows: list[int | None] = []
+    for window in windows:
+        if window not in unique_windows:
+            unique_windows.append(window)
+    cache = {window: build(window) for window in unique_windows}
+    if len(unique_windows) == 1:
+        return cache[unique_windows[0]]
+    block_masks = [cache[window][0] for window in windows]
+    dense_masks = [cache[window][1] for window in windows]
+    return block_masks, dense_masks
+
+
+def _document_boundary_validity(
+    valid: torch.Tensor,
+    *,
+    indices: torch.Tensor,
+    document_ids: torch.Tensor,
+    block_size: int,
+    seq_len: int,
+    label_shift: int = 0,
+) -> torch.Tensor:
+    """Drop candidate anchors whose labels would cross a document boundary.
+
+    ``indices`` holds candidate anchor positions as ``[B, N]`` and
+    ``document_ids`` the per-token document id (``-1`` marks packing padding). A
+    candidate stays valid only when its whole label span shares one non-negative
+    document id, so an anchored draft never crosses a packing boundary.
+
+    ``label_shift`` selects the label layout: DFlash keeps same-position blocks
+    whose last label sits at ``anchor + block_size - 1`` (``label_shift=0``),
+    while DSpark/DOMINO use next-token shifted labels ending at ``anchor +
+    block_size`` (``label_shift=1``).
+    """
+
+    docs = document_ids[:, : indices.shape[1]]
+    window_tail = (indices + block_size - 1 + label_shift).clamp(max=seq_len - 1)
+    tail_docs = torch.gather(document_ids, 1, window_tail)
+    return valid & (docs >= 0) & (docs == tail_docs)
 
 
 class DFlashTrainingModel(nn.Module):
@@ -153,6 +336,41 @@ class DFlashTrainingModel(nn.Module):
         self.sampled_ce_negatives = max(int(sampled_ce_negatives), 0)
         self._tensor_template_cache: dict[tuple, torch.Tensor] = {}
 
+    def _auxiliary_loss(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        safe_label_indices: torch.Tensor,
+        active_mask: torch.Tensor,
+        active_hidden: torch.Tensor,
+        active_logits: torch.Tensor,
+        active_targets: torch.Tensor,
+        active_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
+        """Extra loss term contributed by a DFlash variant's own head.
+
+        Called once per step with the intermediates of the main CE path, at the
+        point where they all exist. Plain DFlash has no auxiliary head and
+        returns ``None``, leaving the loss untouched.
+
+        Args:
+            input_ids: ``[bsz, seq_len]`` full sequence, for variants that need
+                neighbouring tokens (for example a predecessor token).
+            safe_label_indices: ``[bsz, n_blocks, block_size]`` clamped absolute
+                positions each block slot predicts.
+            active_mask: ``[bsz * n_blocks * block_size]`` bool mask of the rows
+                that carry loss weight.
+            active_hidden: ``[num_active, hidden]`` backbone states of those rows.
+            active_logits: ``[num_active, vocab]`` drafter logits of those rows.
+            active_targets: ``[num_active]`` ground-truth token ids.
+            active_weights: ``[num_active]`` per-row loss weights.
+
+        Returns:
+            tuple: ``(loss_or_None, metrics)`` to add to the total loss and the
+            diagnostics dict.
+        """
+        return None, {}
+
     def _cached_arange(
         self,
         name: str,
@@ -183,7 +401,11 @@ class DFlashTrainingModel(nn.Module):
         return cached
 
     def _sample_anchor_positions(
-        self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
+        self,
+        seq_len: int,
+        loss_mask: torch.Tensor,
+        device: torch.device,
+        document_ids: torch.Tensor | None = None,
     ):
         bsz = loss_mask.shape[0]
         max_anchor = max(seq_len - self.block_size, 0)
@@ -197,12 +419,20 @@ class DFlashTrainingModel(nn.Module):
             return anchors, keep_mask
 
         valid = loss_mask[:, : max_anchor + 1] > 0.5
-        valid_counts = valid.sum(dim=1)
         indices = (
             self._cached_arange("anchor_indices", max_anchor + 1, device)
             .unsqueeze(0)
             .expand(bsz, -1)
         )
+        if document_ids is not None:
+            valid = _document_boundary_validity(
+                valid,
+                indices=indices,
+                document_ids=document_ids,
+                block_size=self.block_size,
+                seq_len=seq_len,
+            )
+        valid_counts = valid.sum(dim=1)
         masked_indices = torch.where(valid, indices, seq_len + 1)
         random_vals = torch.rand(bsz, max_anchor + 1, device=device)
         random_vals = torch.where(valid, random_vals, 2.0)
@@ -309,12 +539,13 @@ class DFlashTrainingModel(nn.Module):
         hidden_states_list: list[torch.Tensor],
         loss_mask: torch.Tensor,
         lm_head_weight: torch.Tensor,
+        document_ids: torch.Tensor | None = None,
     ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
         context_feature = self.draft_model.extract_context_feature(hidden_states_list)
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device
+            seq_len, loss_mask, device, document_ids=document_ids
         )
         n_blocks = anchor_positions.shape[1]
         noise_embedding = self._create_noise_embed(
@@ -323,28 +554,16 @@ class DFlashTrainingModel(nn.Module):
         context_position_ids, draft_position_ids = self._create_position_ids(
             anchor_positions, seq_len
         )
-        draft_len = n_blocks * self.block_size
 
-        block_mask = None
-        dense_attention_mask = None
-        if device.type == "cuda":
-            block_mask = compile_friendly_create_block_mask(
-                mask_mod=_create_dflash_mask_mod(
-                    anchor_positions, block_keep_mask, seq_len, self.block_size
-                ),
-                B=bsz,
-                H=None,
-                Q_LEN=draft_len,
-                KV_LEN=seq_len + draft_len,
-                device=device,
-            )
-        else:
-            dense_attention_mask = _create_dflash_dense_attention_mask(
-                anchor_positions,
-                block_keep_mask,
-                seq_len,
-                self.block_size,
-            )
+        block_mask, dense_attention_mask = build_dflash_attention_masks(
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            ctx_len=seq_len,
+            block_size=self.block_size,
+            device=device,
+            windows=_resolve_sliding_windows(self.draft_model.config),
+            document_ids=document_ids,
+        )
 
         draft_hidden = self.draft_model(
             draft_input_ids=None,
@@ -450,6 +669,20 @@ class DFlashTrainingModel(nn.Module):
             valid_token_count = active_loss_weights.sum().clamp(min=1e-6)
             local_ploss_sum = (active_loss * active_loss_weights).sum()
             loss = local_ploss_sum / valid_token_count
+
+        auxiliary_metrics: dict[str, torch.Tensor] = {}
+        if active_targets.numel() > 0:
+            auxiliary_loss, auxiliary_metrics = self._auxiliary_loss(
+                input_ids=input_ids,
+                safe_label_indices=safe_label_indices,
+                active_mask=active_mask,
+                active_hidden=active_hidden,
+                active_logits=active_logits,
+                active_targets=active_targets,
+                active_weights=active_weights,
+            )
+            if auxiliary_loss is not None:
+                loss = loss + auxiliary_loss
 
         with torch.no_grad():
             correct = torch.zeros_like(binary_eval_mask, dtype=torch.bool)
@@ -570,11 +803,29 @@ class DFlashTrainingModel(nn.Module):
             loss_sum_per_position = (
                 loss_per_token.view(bsz, n_blocks, self.block_size) * binary_weights
             ).sum(dim=(0, 1))
-            correct_per_position = (
-                correct.view(bsz, n_blocks, self.block_size).float().sum(dim=(0, 1))
-            )
+            correct_3d = correct.view(bsz, n_blocks, self.block_size)
+            pred_valid_3d = binary_weights[:, :, 1:].bool()
+            pred_correct_3d = correct_3d[:, :, 1:] & pred_valid_3d
+            simulated_accept_length_sum = pred_correct_3d.float().cumprod(dim=-1).sum()
+            simulated_accept_block_count = pred_valid_3d.any(dim=-1).float().sum()
+            correct_per_position = correct_3d.float().sum(dim=(0, 1))
             loss_per_position = loss_sum_per_position / count_per_pos
             acc_per_position = correct_per_position / count_per_pos
+            # Prefix acceptance per block; the per-position accuracies above are
+            # marginals and cannot be combined into it. Column 0 is this layout's
+            # anchor, so it is dropped. The scoring mask is intersected with the
+            # reweighted mask because `correct` was only written where
+            # `active_mask` held: a position zeroed by loss decay or by
+            # `front_position_weight` is unscored, not a mismatch, and reading it
+            # as a mismatch would truncate every block's prefix.
+            block_drafted = slice(1, None)
+            block_scored = (binary_weights > 0) & (
+                flat_weights.view(bsz, n_blocks, self.block_size) > 0
+            )
+            accepted_length_sum, scored_block_count = _block_acceptance_counts(
+                correct.view(bsz, n_blocks, self.block_size)[:, :, block_drafted],
+                block_scored[:, :, block_drafted],
+            )
             masked_rows = (binary_eval_mask <= 0.5).sum().to(dtype=torch.float32)
             diagnostics = {
                 "correct_count": correct.sum().float(),
@@ -584,11 +835,15 @@ class DFlashTrainingModel(nn.Module):
                 "quality_token_count": quality_token_count,
                 "valid_token_count": binary_eval_mask.sum().float(),
                 "weighted_token_count": flat_weights.sum().float(),
+                "simulated_accept_length_sum": simulated_accept_length_sum,
+                "simulated_accept_block_count": simulated_accept_block_count,
                 "sanitized_rows": sanitized_rows,
                 "masked_rows": masked_rows,
                 "loss_sum_per_position": loss_sum_per_position,
                 "correct_per_position": correct_per_position,
                 "count_per_position": count_per_position,
+                "accepted_length_sum": accepted_length_sum,
+                "scored_block_count": scored_block_count,
                 "sampled_vocab_size": torch.tensor(
                     float(restricted_vocab.numel())
                     if self.loss_mode in {"restricted_ce", "sampled_ce"}
@@ -605,6 +860,7 @@ class DFlashTrainingModel(nn.Module):
                     device=device,
                 ),
             }
+            diagnostics.update(auxiliary_metrics)
 
         return (
             loss,
@@ -617,6 +873,17 @@ class DFlashTrainingModel(nn.Module):
 
 
 class DFlashTrainerBackend:
+    # Checkpoint parameter names that differ from this overlay's own spelling,
+    # as ``{checkpoint key: model key}``. Variants fill this in when the released
+    # checkpoint holds a tensor in a different module type than the overlay does.
+    _CHECKPOINT_KEY_ALIASES: dict[str, str] = {}
+
+    # Hot-publish contract: the block drafters read logits off the frozen target
+    # head and keep the target-seeded embedding frozen, so neither belongs in the
+    # published delta. DSpark and Domino inherit this.
+    trains_draft_lm_head = False
+    trains_draft_embeddings = False
+
     def __init__(self, config, target_model_config):
         self.config = config
         self.target_model_config = target_model_config
@@ -627,13 +894,7 @@ class DFlashTrainerBackend:
         return "dflash"
 
     def setup_optimizer(self, drafter_model, drafter_train_config):
-        trainable_params = [p for p in drafter_model.parameters() if p.requires_grad]
-        return torch.optim.AdamW(
-            trainable_params,
-            lr=drafter_train_config.lr,
-            betas=(0.9, 0.95),
-            weight_decay=drafter_train_config.get("weight_decay", 1e-2),
-        )
+        return build_drafter_optimizer(drafter_model, drafter_train_config)
 
     def setup_scheduler(self, optimizer, train_cfg):
         return build_drafter_lr_scheduler(optimizer, train_cfg)
@@ -679,17 +940,19 @@ class DFlashTrainerBackend:
             if mask_token_id_cfg is not None
             else target_text_config.vocab_size - 1
         )
+        target_head_dim = getattr(target_text_config, "head_dim", None)
         target_layer_ids = training_cfg.get("dflash_target_layer_ids", None)
         if target_layer_ids is None:
             target_layer_ids = build_target_layer_ids(
                 num_context_layers, target_num_hidden_layers
             )
+        num_hidden_layers = int(training_cfg.get("dflash_num_hidden_layers", 1))
         return DFlashConfig(
             hidden_size=hidden_size,
             intermediate_size=int(
                 getattr(target_text_config, "intermediate_size", hidden_size * 4)
             ),
-            num_hidden_layers=int(training_cfg.get("dflash_num_hidden_layers", 1)),
+            num_hidden_layers=num_hidden_layers,
             num_attention_heads=int(getattr(target_text_config, "num_attention_heads")),
             num_key_value_heads=int(
                 getattr(
@@ -698,20 +961,37 @@ class DFlashTrainerBackend:
                     getattr(target_text_config, "num_attention_heads"),
                 )
             ),
+            head_dim=int(target_head_dim) if target_head_dim is not None else None,
             vocab_size=int(target_text_config.vocab_size),
             rms_norm_eps=float(getattr(target_text_config, "rms_norm_eps", 1e-6)),
             max_position_embeddings=int(
                 getattr(target_text_config, "max_position_embeddings", 32768)
             ),
-            rope_theta=float(getattr(target_text_config, "rope_theta", 10000.0)),
+            rope_theta=resolve_rope_theta(target_text_config),
             num_target_layers=target_num_hidden_layers,
             num_context_layers=num_context_layers,
             target_hidden_size=int(target_text_config.hidden_size),
             target_num_hidden_layers=target_num_hidden_layers,
             target_layer_ids=target_layer_ids,
             mask_token_id=mask_token_id,
+            **_sliding_window_config(
+                training_cfg.get("dflash_sliding_window", None), num_hidden_layers
+            ),
             architectures=["DFlashDraftModel"],
         )
+
+    @staticmethod
+    def _target_rope_theta(target_text_config) -> float:
+        rope_theta = getattr(target_text_config, "rope_theta", None)
+        if rope_theta is not None:
+            return float(rope_theta)
+        rope_parameters = getattr(target_text_config, "rope_parameters", None)
+        if (
+            isinstance(rope_parameters, dict)
+            and rope_parameters.get("rope_theta") is not None
+        ):
+            return float(rope_parameters["rope_theta"])
+        return 10000.0
 
     def _load_state_file(self, path: str) -> dict:
         if path.endswith(".safetensors"):
@@ -762,7 +1042,26 @@ class DFlashTrainerBackend:
                     normalized_key = normalized_key[len(prefix) :]
                     break
             normalized_state[normalized_key] = value
+        # Aliases run after prefix stripping, and a key already spelled the way
+        # the model spells it wins, so a checkpoint this overlay wrote itself is
+        # never rewritten.
+        for source, target in self._CHECKPOINT_KEY_ALIASES.items():
+            if source in normalized_state:
+                normalized_state.setdefault(target, normalized_state.pop(source))
         return normalized_state
+
+    def _validate_normalized_state(
+        self,
+        draft_model: DFlashDraftModel,
+        normalized_state: dict[str, torch.Tensor],
+        model_path: str,
+    ) -> None:
+        """Variant hook to reject a checkpoint the base gate cannot judge.
+
+        The base gate only knows the DFlash backbone, and unrecognized keys are
+        dropped rather than raised on, so a variant whose extra modules arrive
+        under other names must say so here.
+        """
 
     def _infer_num_context_layers_from_state(
         self, normalized_state: dict[str, torch.Tensor], target_hidden_size: int
@@ -908,6 +1207,7 @@ class DFlashTrainerBackend:
                 "DFlash/DSpark checkpoint does not use the canonical vLLM parameter names; "
                 f"missing={missing_backbone_keys} model_path={model_path}"
             )
+        self._validate_normalized_state(draft_model, normalized_state, model_path)
 
         model_state = draft_model.state_dict()
         filtered_state: dict[str, torch.Tensor] = {}
@@ -931,7 +1231,12 @@ class DFlashTrainerBackend:
 
         missing, _ = draft_model.load_state_dict(filtered_state, strict=False)
         if unexpected or missing or mismatched:
-            logger.debug(
+            # Dropped and shape-mismatched keys mean checkpoint tensors did not
+            # reach the model, which shows up later only as a weak drafter, so
+            # say so at warning level. Missing keys alone are routine (the
+            # embedding is loaded separately), so they stay at debug.
+            log = logger.warning if (unexpected or mismatched) else logger.debug
+            log(
                 "DFlash draft checkpoint load report from %s: loaded=%s missing=%s unexpected=%s mismatched=%s",
                 model_path,
                 len(filtered_state),
@@ -1100,10 +1405,12 @@ class DFlashTrainerBackend:
             else:
                 item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
                 item_loss_mask[:] = 1.0
-            valid_len = min(ids.size(0), full_h.size(0), item_loss_mask.size(0))
-            ids = ids[:valid_len]
-            full_h = full_h[:valid_len]
-            item_loss_mask = item_loss_mask[:valid_len]
+            if not (ids.size(0) == full_h.size(0) == item_loss_mask.size(0)):
+                raise ValueError(
+                    "DFlash input/hidden/mask row mismatch: "
+                    f"input_rows={ids.size(0)}, hidden_rows={full_h.size(0)}, "
+                    f"mask_rows={item_loss_mask.size(0)}"
+                )
             nonzero = torch.nonzero(item_loss_mask)
             if nonzero.numel() > 0:
                 r_start = nonzero[0, 0]
@@ -1141,6 +1448,7 @@ class DFlashTrainerBackend:
             hidden_states_list=hidden_states_list,
             loss_mask=batch["loss_mask"],
             lm_head_weight=self.target_lm_head.fc.weight,
+            document_ids=batch.get("document_ids"),
         )
         local_num_tokens = count_pp.sum().to(loss.device, dtype=loss.dtype)
         return {

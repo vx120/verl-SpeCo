@@ -62,12 +62,21 @@ def _copy_overlay_configs(
 def test_overlay_has_expected_default_drafter_shape() -> None:
     raw = OmegaConf.load(CONFIG_DIR / "speco_base.yaml")
     drafter = raw.actor_rollout_ref.rollout.drafter
+    standalone = OmegaConf.load(CONFIG_DIR / "draft_trainer.yaml")
+    standalone_training = standalone.actor_rollout_ref.rollout.drafter.training
 
     assert raw.speco.verl_base.version == "0.8.0"
     assert raw.speco.verl_base.branch == "release/v0.8.0"
+    assert list(raw.speco.verl_base.supported_versions) == ["0.8.0", "0.9.0"]
+    assert list(raw.speco.verl_base.supported_branches) == [
+        "release/v0.8.0",
+        "release/v0.9.0",
+    ]
     assert drafter.enable is False
     assert drafter.enable_drafter_training is False
     assert drafter.training.collect_hidden_states_from_sgl is False
+    assert drafter.training.dspark_confidence_loss_alpha == 0.0
+    assert drafter.training.dspark_l1_loss_alpha == 0.9
     assert drafter.training.collect_hidden_states_from_old_logprob is False
     assert drafter.vllm.allow_lossy_speculative_sampling is False
     assert drafter.training.allow_sglang_prenorm_last_layer is False
@@ -78,13 +87,24 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     assert drafter.training.warmup_style is None
     assert drafter.training.resume_trainer_state_from_checkpoint is True
     assert drafter.training.eagle1_num_hidden_layers == 1
+    assert drafter.training.mode == "online"
+    assert drafter.training.feature_store.type == "torch_shard"
+    assert "target_feature_replay" not in drafter.training
+    assert standalone_training.target_feature_replay.cache.enabled is False
+    assert standalone_training.target_feature_replay.cache.max_size_gb == 0
+    assert standalone_training.target_feature_replay.vllm_endpoints is None
+    assert standalone_training.target_feature_replay.endpoint_cooldown == 5
+    assert standalone_training.target_feature_pipeline.enabled is False
+    assert standalone_training.target_feature_pipeline.concurrency == 16
+    assert standalone_training.target_feature_pipeline.producer_prefetch_depth == 4
+    assert standalone_training.target_feature_pipeline.prefetch_depth == 2
 
 
 def test_overlay_composes_with_release_upstream_verl(tmp_path: Path) -> None:
     upstream_root = os.getenv("VERL_SPECO_UPSTREAM_ROOT")
     if not upstream_root:
         pytest.skip(
-            "set VERL_SPECO_UPSTREAM_ROOT to check compose against release/v0.8.0 verl"
+            "set VERL_SPECO_UPSTREAM_ROOT to check compose against a supported verl"
         )
     upstream_config = _upstream_repo_root(upstream_root) / "verl" / "trainer" / "config"
     assert upstream_config.is_dir()
@@ -100,6 +120,7 @@ def test_overlay_composes_with_release_upstream_verl(tmp_path: Path) -> None:
     assert config.speco.verl_base.version == "0.8.0"
     assert config.actor_rollout_ref.rollout.drafter.enable is False
     assert "trainer" in config
+    assert config.trainer.use_v1 is False
     assert "algorithm" in config
 
 
@@ -107,7 +128,7 @@ def test_draft_trainer_composes_as_primary_config(tmp_path: Path) -> None:
     upstream_root = os.getenv("VERL_SPECO_UPSTREAM_ROOT")
     if not upstream_root:
         pytest.skip(
-            "set VERL_SPECO_UPSTREAM_ROOT to check compose against release/v0.8.0 verl"
+            "set VERL_SPECO_UPSTREAM_ROOT to check compose against a supported verl"
         )
     upstream_config = _upstream_repo_root(upstream_root) / "verl" / "trainer" / "config"
     assert upstream_config.is_dir()
@@ -121,6 +142,13 @@ def test_draft_trainer_composes_as_primary_config(tmp_path: Path) -> None:
         config = compose(config_name="draft_trainer")
 
     assert config.actor_rollout_ref.rollout.drafter.training.mode == "offline"
+    assert config.actor_rollout_ref.rollout.drafter.training.feature_store.type == (
+        "torch_shard"
+    )
+    assert (
+        config.actor_rollout_ref.rollout.drafter.training.target_feature_replay.cache.enabled
+        is False
+    )
     assert config.speco.draft_training.enable is True
     assert "trainer" in config
     assert "algorithm" in config
@@ -171,3 +199,34 @@ def test_opd_drafter_modes_compose_with_fsdp2(
     validate_sync_opd_cotrain_config(config)
     assert config.actor_rollout_ref.actor.strategy == "fsdp2"
     assert "drafter" not in config.distillation.teacher_models.teacher_model.inference
+
+
+def test_veomni_trainer_composes_with_release_upstream_verl(tmp_path: Path) -> None:
+    upstream_root = os.getenv("VERL_SPECO_UPSTREAM_ROOT")
+    if not upstream_root:
+        pytest.skip(
+            "set VERL_SPECO_UPSTREAM_ROOT to check compose against release/v0.8.0 verl"
+        )
+    upstream_config = _upstream_repo_root(upstream_root) / "verl" / "trainer" / "config"
+    assert upstream_config.is_dir()
+
+    composed_config_dir = tmp_path / "config"
+    _copy_overlay_configs(
+        upstream_config,
+        composed_config_dir,
+        ("speco_base.yaml", "speco_veomni_trainer.yaml"),
+    )
+
+    with initialize_config_dir(config_dir=str(composed_config_dir), version_base=None):
+        config = compose(config_name="speco_veomni_trainer")
+
+    assert config.model_engine == "veomni"
+    assert config.actor_rollout_ref.actor.strategy == "veomni"
+    assert "veomni" in config.actor_rollout_ref.actor
+    assert "optim" in config.actor_rollout_ref.actor
+    assert config.actor_rollout_ref.actor.veomni.router_replay.mode == "disabled"
+    assert config.actor_rollout_ref.ref.strategy == "veomni"
+    assert "veomni" in config.actor_rollout_ref.ref
+    assert config.critic.strategy == "veomni"
+    assert "veomni" in config.critic
+    assert "fsdp_config" in config.actor_rollout_ref.rollout.drafter.training

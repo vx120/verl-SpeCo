@@ -14,17 +14,54 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
+from verl_speco.integration import oldlogprob_runtime
 from verl_speco.integration.oldlogprob_runtime import (
+    OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
+    _find_layers_and_final_norm,
+    _hidden_state_capture_target,
+    _install_oldlogprob_fsdp_batch_postprocess_patch,
+    _resolve_hidden_state,
     _select_and_merge_concatenated_hidden,
+    _to_cpu_transfer_tensor,
     oldlogprob_hidden_runtime_enabled,
 )
 from verl_speco.integration.oldlogprob_layer_ids import (
     eagle3_num_aux_hidden_states_from_config,
     resolve_oldlogprob_aux_layer_ids,
 )
+
+
+def test_fsdp2_runtime_install_does_not_import_veomni(monkeypatch) -> None:
+    imported_modules = []
+    fsdp_module = SimpleNamespace(__name__="verl.workers.engine.fsdp.transformer_impl")
+
+    def fake_import_module(name: str):
+        imported_modules.append(name)
+        if name == "verl.workers.engine.fsdp.transformer_impl":
+            return fsdp_module
+        raise AssertionError(f"unexpected backend import: {name}")
+
+    monkeypatch.setattr(oldlogprob_runtime, "_PATCHED", True)
+    monkeypatch.setattr(oldlogprob_runtime.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(
+        oldlogprob_runtime,
+        "_install_oldlogprob_fsdp_batch_postprocess_patch",
+        lambda module: module is fsdp_module,
+    )
+    monkeypatch.setattr(
+        oldlogprob_runtime,
+        "_install_oldlogprob_training_worker_postprocess_patch",
+        lambda: True,
+    )
+
+    assert oldlogprob_runtime.install_oldlogprob_hidden_runtime_patch(
+        actor_backend="fsdp2"
+    )
+    assert imported_modules == ["verl.workers.engine.fsdp.transformer_impl"]
 
 
 def _drafter(enabled: bool) -> dict:
@@ -96,6 +133,39 @@ def test_eagle3_oldlogprob_falls_back_to_default_three_layers() -> None:
     assert (
         eagle3_num_aux_hidden_states_from_config({"speculative_algorithm": "EAGLE3"})
         is None
+    )
+
+
+def test_eagle3_output_ids_select_same_physical_hidden_states_as_vllm() -> None:
+    torch = pytest.importorskip("torch")
+    hidden_states = tuple(torch.tensor([index]) for index in range(37))
+
+    selected = [
+        _resolve_hidden_state(hidden_states, layer_id, layer_id_space="output")
+        for layer_id in [2, 18, 33]
+    ]
+
+    assert [int(value.item()) for value in selected] == [2, 18, 33]
+    assert _hidden_state_capture_target(2, 36, layer_id_space="output") == (
+        "layer",
+        1,
+    )
+
+
+def test_decoder_ids_keep_hf_embedding_offset_for_dflash_and_eagle12() -> None:
+    torch = pytest.importorskip("torch")
+    hidden_states = tuple(torch.tensor([index]) for index in range(37))
+
+    assert int(
+        _resolve_hidden_state(hidden_states, 2, layer_id_space="decoder").item()
+    ) == 3
+    assert _hidden_state_capture_target(2, 36, layer_id_space="decoder") == (
+        "layer",
+        2,
+    )
+    assert _hidden_state_capture_target(35, 36, layer_id_space="decoder") == (
+        "final",
+        None,
     )
 
 
@@ -191,6 +261,34 @@ def test_unselected_flat_hidden_keeps_original_row_selection() -> None:
     torch.testing.assert_close(selected[1, 0], hidden[2])
 
 
+def test_cpu_transfer_tensor_detaches_cpu_tensor_without_copy() -> None:
+    torch = pytest.importorskip("torch")
+    source = torch.tensor([1.0], requires_grad=True)
+
+    transferred = _to_cpu_transfer_tensor(source)
+
+    assert transferred.device.type == "cpu"
+    assert transferred.requires_grad is False
+    assert transferred.data_ptr() == source.data_ptr()
+    torch.testing.assert_close(transferred, source.detach())
+
+
+def test_cpu_transfer_tensor_detaches_sparse_payload_rows() -> None:
+    torch = pytest.importorskip("torch")
+    payload = {
+        "rows": torch.tensor([[1.0]], requires_grad=True),
+        "batch_indices": [0],
+        "row_indices": [[0]],
+    }
+
+    transferred = _to_cpu_transfer_tensor(payload)
+
+    assert transferred["rows"].device.type == "cpu"
+    assert transferred["rows"].requires_grad is False
+    assert transferred["rows"].data_ptr() == payload["rows"].data_ptr()
+    assert transferred["batch_indices"] == [0]
+
+
 def test_forward_hook_rejects_malformed_selected_hidden() -> None:
     torch = pytest.importorskip("torch")
     context = _selection_context(batch_size=4, hidden_rows=129)
@@ -201,3 +299,74 @@ def test_forward_hook_rejects_malformed_selected_hidden() -> None:
             [torch.randn(4, 128, 8)],
             already_selected=True,
         )
+
+
+@pytest.mark.parametrize("root_attr", ["model", "thinker"])
+def test_hidden_layer_discovery_supports_veomni_multimodal_wrappers(
+    root_attr: str,
+) -> None:
+    torch = pytest.importorskip("torch")
+    nn = torch.nn
+
+    text_model = SimpleNamespace(
+        layers=nn.ModuleList([nn.Linear(4, 4), nn.Linear(4, 4)]),
+        norm=nn.LayerNorm(4),
+    )
+    if root_attr == "model":
+        module = SimpleNamespace(model=SimpleNamespace(language_model=text_model))
+    else:
+        module = SimpleNamespace(thinker=SimpleNamespace(model=text_model))
+
+    layers, final_norm = _find_layers_and_final_norm(SimpleNamespace(module=module))
+
+    assert len(layers) == 2
+    assert layers[0] is text_model.layers[0]
+    assert final_norm is text_model.norm
+
+
+def test_batch_postprocess_patch_is_installed_per_engine_module() -> None:
+    module_a = SimpleNamespace(
+        __name__="fake.fsdp.transformer_impl",
+        postprocess_batch_func=lambda output_lst, indices, data: {"engine": "fsdp"},
+    )
+    module_b = SimpleNamespace(
+        __name__="fake.veomni.transformer_impl",
+        postprocess_batch_func=lambda output_lst, indices, data: {"engine": "veomni"},
+    )
+
+    assert _install_oldlogprob_fsdp_batch_postprocess_patch(module_a)
+    assert _install_oldlogprob_fsdp_batch_postprocess_patch(module_b)
+    assert module_a.postprocess_batch_func([], None, None) == {"engine": "fsdp"}
+    assert module_b.postprocess_batch_func([], None, None) == {"engine": "veomni"}
+
+
+def test_veomni_batch_postprocess_keeps_router_replay_output() -> None:
+    def native_postprocess(output_lst, indices, data):
+        model_output = output_lst[0]["model_output"]
+        assert model_output["routed_experts"] == "routes"
+        assert OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY not in model_output
+        return {"model_output": {"routed_experts": "routes"}}
+
+    module = SimpleNamespace(
+        __name__="fake.veomni.router_replay.transformer_impl",
+        postprocess_batch_func=native_postprocess,
+    )
+    assert _install_oldlogprob_fsdp_batch_postprocess_patch(module)
+
+    result = module.postprocess_batch_func(
+        [
+            {
+                "model_output": {
+                    "routed_experts": "routes",
+                    OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY: ["hidden-ref"],
+                }
+            }
+        ],
+        None,
+        None,
+    )
+
+    assert result["model_output"]["routed_experts"] == "routes"
+    assert result["model_output"][OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY] == [
+        "hidden-ref"
+    ]

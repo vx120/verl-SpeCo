@@ -50,10 +50,13 @@ import torch.nn.functional as F
 from verl_speco.backends.dflash_trainer_backend import (
     DFlashTrainerBackend,
     DFlashTrainingModel,
-    _create_dflash_dense_attention_mask,
-    _create_dflash_mask_mod,
+    _block_acceptance_counts,
+    _resolve_sliding_windows,
+    build_dflash_attention_masks,
+    _document_boundary_validity,
 )
-from verl_speco.models.dflash.flex_attention import compile_friendly_create_block_mask
+from verl_speco.backends.lr_scheduler import _RESUME_OPTIMIZER_STEPS_KEY
+from verl_speco.models.dflash import resolve_rope_theta
 from verl_speco.models.domino import DominoConfig, DominoDraftModel
 from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
 
@@ -99,7 +102,19 @@ class DominoTrainingModel(DFlashTrainingModel):
         self.pure_draft_prefix_len = int(pure_draft_prefix_len)
         self.lambda_base_start = float(lambda_base_start)
         self.lambda_base_decay_steps = int(lambda_base_decay_steps)
-        self._forward_count = 0
+        self._curriculum_step = 0
+
+    def set_curriculum_step(self, step: int) -> None:
+        """Seed the base-anchor curriculum from already-completed optimizer steps.
+
+        ``lambda_base`` is a function of the training step, but the counter lives
+        on this wrapper and is not part of any drafter checkpoint, so a resumed
+        run would otherwise restart the curriculum at ``lambda_base_start``. At
+        the default ``lambda_base_start=1.0`` the loss is exactly the base loss,
+        so the correction head (``prefix_gru`` / ``embed_proj``) would receive
+        zero gradient for a full decay window after every resume.
+        """
+        self._curriculum_step = max(int(step), 0)
 
     @property
     def _suffix_start(self) -> int:
@@ -109,12 +124,16 @@ class DominoTrainingModel(DFlashTrainingModel):
 
     def _current_lambda_base(self) -> float:
         return get_lambda_base(
-            self._forward_count, self.lambda_base_decay_steps, self.lambda_base_start
+            self._curriculum_step, self.lambda_base_decay_steps, self.lambda_base_start
         )
 
     # --- shifted-label anchor sampling / label building (DSpark alignment) ---
     def _sample_anchor_positions(
-        self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
+        self,
+        seq_len: int,
+        loss_mask: torch.Tensor,
+        device: torch.device,
+        document_ids: torch.Tensor | None = None,
     ):
         bsz = loss_mask.shape[0]
         num_candidates = max(seq_len - 1, 0)
@@ -130,12 +149,21 @@ class DominoTrainingModel(DFlashTrainingModel):
         valid = (loss_mask[:, :num_candidates] > 0.5) & (
             loss_mask[:, 1 : num_candidates + 1] > 0.5
         )
-        valid_counts = valid.sum(dim=1)
         indices = (
             self._cached_arange("domino_anchor_indices", num_candidates, device)
             .unsqueeze(0)
             .expand(bsz, -1)
         )
+        if document_ids is not None:
+            valid = _document_boundary_validity(
+                valid,
+                indices=indices,
+                document_ids=document_ids,
+                block_size=self.block_size,
+                seq_len=seq_len,
+                label_shift=1,
+            )
+        valid_counts = valid.sum(dim=1)
         masked_indices = torch.where(valid, indices, seq_len + 1)
         random_vals = torch.rand(bsz, num_candidates, device=device)
         random_vals = torch.where(valid, random_vals, 2.0)
@@ -198,15 +226,22 @@ class DominoTrainingModel(DFlashTrainingModel):
         )
         return target_ids, prev_token_ids, eval_mask, label_indices
 
-    def forward(self, input_ids, hidden_states_list, loss_mask, lm_head_weight):
+    def forward(
+        self,
+        input_ids,
+        hidden_states_list,
+        loss_mask,
+        lm_head_weight,
+        document_ids=None,
+    ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
-        self._forward_count += 1
+        self._curriculum_step += 1
         lambda_base = self._current_lambda_base()
 
         context_feature = self.draft_model.extract_context_feature(hidden_states_list)
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len, loss_mask, device
+            seq_len, loss_mask, device, document_ids=document_ids
         )
         n_blocks = anchor_positions.shape[1]
         noise_embedding = self._create_noise_embed(
@@ -215,28 +250,15 @@ class DominoTrainingModel(DFlashTrainingModel):
         context_position_ids, draft_position_ids = self._create_position_ids(
             anchor_positions, seq_len
         )
-        draft_len = n_blocks * self.block_size
-
-        block_mask = None
-        dense_attention_mask = None
-        if device.type == "cuda":
-            block_mask = compile_friendly_create_block_mask(
-                mask_mod=_create_dflash_mask_mod(
-                    anchor_positions, block_keep_mask, seq_len, self.block_size
-                ),
-                B=bsz,
-                H=None,
-                Q_LEN=draft_len,
-                KV_LEN=seq_len + draft_len,
-                device=device,
-            )
-        else:
-            dense_attention_mask = _create_dflash_dense_attention_mask(
-                anchor_positions,
-                block_keep_mask,
-                seq_len,
-                self.block_size,
-            )
+        block_mask, dense_attention_mask = build_dflash_attention_masks(
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            ctx_len=seq_len,
+            block_size=self.block_size,
+            device=device,
+            windows=_resolve_sliding_windows(self.draft_model.config),
+            document_ids=document_ids,
+        )
 
         draft_hidden = self.draft_model(
             draft_input_ids=None,
@@ -374,6 +396,14 @@ class DominoTrainingModel(DFlashTrainingModel):
                 min=1.0
             )
             acc_per_position = correct_per_position / count_per_position.clamp(min=1.0)
+            # Prefix acceptance per block; the per-position accuracies above are
+            # marginals and cannot be combined into it. Labels here are shifted
+            # by one, so unlike DFlash there is no anchor column: every position
+            # is a real prediction and none may be sliced off.
+            accepted_length_sum, scored_block_count = _block_acceptance_counts(
+                correct.view(bsz, n_blocks, self.block_size),
+                binary_weights > 0,
+            )
             valid_token_count = active_weights.sum().to(dtype=torch.float32)
             weighted_token_count = flat_weights.sum().to(dtype=torch.float32)
             accuracy = correct.float().sum() / binary_eval_mask.float().sum().clamp(
@@ -401,6 +431,8 @@ class DominoTrainingModel(DFlashTrainingModel):
             "loss_sum_per_position": loss_sum_per_position.detach(),
             "correct_per_position": correct_per_position.detach(),
             "count_per_position": count_per_position.detach(),
+            "accepted_length_sum": accepted_length_sum.detach(),
+            "scored_block_count": scored_block_count.detach(),
             "local_ploss_sum": (loss_per_token * binary_eval_mask.float())
             .sum()
             .detach(),
@@ -430,6 +462,25 @@ class DominoTrainerBackend(DFlashTrainerBackend):
     @property
     def model_type(self):
         return "domino"
+
+    def setup_optimizer(self, drafter_model, drafter_train_config):
+        """Build the optimizer and resume the base-anchor curriculum alongside it.
+
+        ``_resume_optimizer_steps`` is the only step counter that survives a
+        drafter checkpoint (the LR scheduler already restores itself from it), so
+        the Domino curriculum is seeded from the same value instead of restarting
+        at step zero.
+        """
+        optimizer = super().setup_optimizer(drafter_model, drafter_train_config)
+        module = (
+            drafter_model.module if hasattr(drafter_model, "module") else drafter_model
+        )
+        set_curriculum_step = getattr(module, "set_curriculum_step", None)
+        if callable(set_curriculum_step):
+            set_curriculum_step(
+                int(drafter_train_config.get(_RESUME_OPTIMIZER_STEPS_KEY, 0) or 0)
+            )
+        return optimizer
 
     def _training_value(
         self, training_cfg, domino_key: str, dflash_key: str, default: Any
@@ -514,7 +565,7 @@ class DominoTrainerBackend(DFlashTrainerBackend):
             max_position_embeddings=int(
                 getattr(target_text_config, "max_position_embeddings", 32768)
             ),
-            rope_theta=float(getattr(target_text_config, "rope_theta", 10000.0)),
+            rope_theta=resolve_rope_theta(target_text_config),
             num_target_layers=target_num_hidden_layers,
             num_context_layers=num_context_layers,
             target_hidden_size=int(target_text_config.hidden_size),
