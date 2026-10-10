@@ -49,6 +49,12 @@ from verl_speco.trainer.standalone_resume import (
     load_standalone_resume,
     save_standalone_resume,
 )
+from verl_speco.trainer.standalone_tracking import (
+    _build_standalone_tracking,
+    _finish_standalone_tracking,
+    _log_standalone_tracking_metrics,
+    _select_standalone_tracking_metrics,
+)
 from verl_speco.trainer.tq_sample_source import TQFeatureDataLoader, TQLocalBatch
 
 logger = logging.getLogger(__name__)
@@ -85,6 +91,7 @@ async def _run_standalone_draft_training_async(
     training_events: Any | None = None,
 ) -> dict[str, Any]:
     rank, local_rank, world_size = _init_distributed()
+    standalone_trackers: list[Any] = []
     logger.info(
         "[standalone rank=%s] distributed runtime initialized local_rank=%s world_size=%s",
         rank,
@@ -161,6 +168,10 @@ async def _run_standalone_draft_training_async(
     feature_producer = None
     current_stage = "activate_training_model"
     try:
+        # Scheduled Ray training delegates tracking to its Driver, which also
+        # receives Producer windows. Subprocess/file training logs locally.
+        if training_events is None:
+            standalone_trackers = _build_standalone_tracking(config, rank=rank)
         stage_started = time.perf_counter()
         logger.info(
             "[standalone rank=%s] activating drafter model algorithm=%s",
@@ -540,6 +551,21 @@ async def _run_standalone_draft_training_async(
             if feature_producer is not None:
                 step_metrics.update(feature_producer.metrics())
             _log_standalone_step_metrics(step_metrics, rank=rank)
+            tracking_metrics = _select_standalone_tracking_metrics(step_metrics)
+            if training_events is not None and rank == 0:
+                training_events.put(
+                    {
+                        "kind": "training_metrics",
+                        "step": optimizer_step,
+                        "metrics": tracking_metrics,
+                    }
+                )
+            else:
+                _log_standalone_tracking_metrics(
+                    standalone_trackers,
+                    tracking_metrics,
+                    step=optimizer_step,
+                )
             if save_interval > 0 and optimizer_step % save_interval == 0:
                 _sync_standalone_export_error(trainer, trainer.runtime_device)
                 current_stage = "save_checkpoint"
@@ -611,6 +637,7 @@ async def _run_standalone_draft_training_async(
         )
         raise
     finally:
+        _finish_standalone_tracking(standalone_trackers, rank=rank)
         logger.info(
             "[standalone rank=%s] cleanup starting stage=%s attempted_batches=%s "
             "successful_steps=%s",
@@ -1332,7 +1359,7 @@ def _build_training_device_mesh(draft_config, world_size: int) -> DeviceMesh | N
 
 def _block_metric_prefix(trainer: DrafterBaseTrainer) -> str | None:
     model_type = str(getattr(getattr(trainer, "backend", None), "model_type", "") or "")
-    if model_type in {"dflash", "dspark", "eagle3"}:
+    if model_type in {"dflash", "dspark", "eagle3", "dflash2"}:
         return model_type
     return None
 
@@ -1393,7 +1420,7 @@ def _standalone_step_metrics(
     }
     prefix = _block_metric_prefix(trainer)
     if prefix is not None:
-        anchor_offset = 1 if prefix == "dflash" else 0
+        anchor_offset = 1 if prefix in {"dflash", "dflash2"} else 0
         losses = _position_metric_series(raw_metrics, prefix, "loss_per_position")
         accuracies = _position_metric_series(
             raw_metrics, prefix, "accuracy_per_position"

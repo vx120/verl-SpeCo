@@ -960,6 +960,18 @@ class DrafterBaseTrainer:
             if key.startswith("timing_s/drafter_"):
                 metrics[key] = value
         prefix = self._block_drafter_metric_prefix()
+        if f"{prefix}/loss" in sums:
+            metrics[f"{prefix}/loss"] = sums[f"{prefix}/loss"] / steps
+        selector_weight = sums.get(f"{prefix}/selector_weight_count", 0.0)
+        if selector_weight > 0:
+            metrics[f"{prefix}/selector_loss"] = (
+                sums[f"{prefix}/selector_loss_sum"] / selector_weight
+            )
+        selector_tokens = sums.get(f"{prefix}/selector_token_count", 0.0)
+        if selector_tokens > 0:
+            metrics[f"{prefix}/selector_accuracy"] = (
+                sums.get(f"{prefix}/selector_correct_count", 0.0) / selector_tokens
+            )
         correct = sums.get(f"{prefix}/correct_count", 0.0)
         eval_tokens = sums.get(f"{prefix}/eval_token_count", 0.0)
         if eval_tokens > 0:
@@ -1095,6 +1107,8 @@ class DrafterBaseTrainer:
             "l1_weighted_token_count": f"{prefix}/l1_weighted_token_count",
             # DFlash2 candidate selector.
             "selector_loss": f"{prefix}/selector_loss",
+            "selector_loss_sum": f"{prefix}/selector_loss_sum",
+            "selector_weight_count": f"{prefix}/selector_weight_count",
             "selector_correct_count": f"{prefix}/selector_correct_count",
             "selector_base_correct_count": f"{prefix}/selector_base_correct_count",
             "selector_token_count": f"{prefix}/selector_token_count",
@@ -3600,6 +3614,14 @@ class DrafterBaseTrainer:
     ) -> dict[str, torch.Tensor]:
         clip_value = self._get_hidden_state_clip_value()
 
+        # Capture per-sample context lengths before bad-input masking zeroes
+        # rows in ``attention_mask``; label sequences may add one trailing row.
+        label_context_lengths = (
+            batch["attention_mask"].sum(dim=1).to(dtype=torch.long)
+            if "label_mask" in batch
+            else None
+        )
+
         loss_mask = torch.nan_to_num(
             batch["loss_mask"].float(), nan=0.0, posinf=0.0, neginf=0.0
         )
@@ -3630,6 +3652,34 @@ class DrafterBaseTrainer:
                     f"[Rank {self.rank}] Masked {masked_tokens} drafter targets due to bad {target_key} rows"
                 )
             batch["loss_mask"] = batch["loss_mask"].masked_fill(bad_target_rows, 0.0)
+
+        if "label_mask" in batch:
+            # ``label_mask`` weights the drafter loss: gate context labels by
+            # their own column and tail labels by the last context row.
+            label_mask = torch.nan_to_num(
+                batch["label_mask"].float(), nan=0.0, posinf=0.0, neginf=0.0
+            )
+            label_mask = torch.where(
+                label_mask > 0,
+                torch.ones_like(label_mask),
+                torch.zeros_like(label_mask),
+            )
+            context_loss_mask = batch["loss_mask"]
+            num_context_cols = int(context_loss_mask.size(1))
+            label_len = int(label_mask.size(1))
+            context_lengths = cast(torch.Tensor, label_context_lengths)
+            for row in range(label_mask.size(0)):
+                ctx_len = min(
+                    int(context_lengths[row].item()), num_context_cols, label_len
+                )
+                label_mask[row, :ctx_len] = (
+                    label_mask[row, :ctx_len] * context_loss_mask[row, :ctx_len]
+                )
+                if label_len > ctx_len:
+                    label_mask[row, ctx_len:] = (
+                        label_mask[row, ctx_len:] * context_loss_mask[row, ctx_len - 1]
+                    )
+            batch["label_mask"] = label_mask
 
         return batch
 
@@ -4028,6 +4078,8 @@ class DrafterBaseTrainer:
         items_dropped_missing_target = 0
         packed_tokens_before_shift = 0
         packed_loss_tokens = 0
+        trailing_label_rows = 0
+        packing_enabled = self._packing_enabled()
 
         # Build training chunks inside each sample before packing. EAGLE3-style
         # models use next-token chunks, while DFlash keeps same-position blocks
@@ -4039,6 +4091,8 @@ class DrafterBaseTrainer:
         last_hidden_state_chunks = []
         target_logprob_chunks = []
         target_last_hidden_state_chunks = []
+        label_id_chunks = []
+        label_mask_chunks = []
 
         ids_list = preprocessed_lists["ids"]
         hidden_list = preprocessed_lists["h_states"]
@@ -4413,6 +4467,14 @@ class DrafterBaseTrainer:
                 position_id_chunks.append(item_position_ids[:train_seq_len])
             if self._is_block_drafter_backend():
                 loss_mask_chunks.append(item_loss_mask[:train_seq_len])
+                # Keep the trailing label token(s) that the context window
+                # cannot represent, so the drafter can still supervise them.
+                block_label_len = min(ids.size(0), item_loss_mask.size(0))
+                if block_label_len > train_seq_len:
+                    trailing_label_rows += 1
+                if not packing_enabled:
+                    label_id_chunks.append(ids[:block_label_len])
+                    label_mask_chunks.append(item_loss_mask[:block_label_len])
             elif uses_shifted_eagle_inputs:
                 loss_mask_chunks.append(item_loss_mask[2 : 2 + train_seq_len])
             else:
@@ -4443,9 +4505,18 @@ class DrafterBaseTrainer:
         if not input_id_chunks:
             return None
 
-        packing_enabled = self._packing_enabled()
+        label_ids = None
+        label_mask = None
         document_ids = None
         if packing_enabled:
+            # Packing carries context chunks only, so it cannot represent the
+            # trailing label token; refuse instead of dropping supervision.
+            if trailing_label_rows:
+                raise NotImplementedError(
+                    "Document-aware packing does not support the trailing drafter "
+                    f"label token ({trailing_label_rows} sample(s) carry one); disable "
+                    "rollout.drafter.training.packing.enable for block drafters."
+                )
             packed = self._pack_block_drafter_batch(
                 input_id_chunks,
                 loss_mask_chunks,
@@ -4492,6 +4563,25 @@ class DrafterBaseTrainer:
                 dtype=position_id_chunks[0].dtype,
                 device=dev,
             )
+            max_label_len = max(chunk.size(0) for chunk in label_id_chunks)
+            label_ids = torch.zeros(
+                len(label_id_chunks),
+                max_label_len,
+                dtype=input_id_chunks[0].dtype,
+                device=dev,
+            )
+            label_mask = torch.zeros(
+                len(label_mask_chunks),
+                max_label_len,
+                dtype=loss_mask_chunks[0].dtype,
+                device=dev,
+            )
+            for row_idx, (label_chunk, label_mask_chunk) in enumerate(
+                zip(label_id_chunks, label_mask_chunks)
+            ):
+                row_len = label_chunk.size(0)
+                label_ids[row_idx, :row_len] = label_chunk
+                label_mask[row_idx, :row_len] = label_mask_chunk
             attn_mask = torch.zeros_like(input_ids, dtype=torch.long, device=dev)
             for row_idx, (ids_chunk, mask_chunk, h_chunk, pos_chunk) in enumerate(
                 zip(
@@ -4567,6 +4657,9 @@ class DrafterBaseTrainer:
             "loss_mask": loss_mask,
             "position_ids": position_ids,
         }
+        if label_ids is not None:
+            batch["label_ids"] = label_ids
+            batch["label_mask"] = label_mask
         if self.backend.model_type == "eagle3":
             if use_logits:
                 batch["target_logprobs"] = target_logprobs
@@ -4587,6 +4680,9 @@ class DrafterBaseTrainer:
             batch["target_last_hidden_states"] = target_last_hidden_states
 
         batch = self._sanitize_training_batch(batch)
+        if label_ids is not None:
+            label_ids = batch["label_ids"]
+            label_mask = batch["label_mask"]
         input_ids = batch["input_ids"]
         attn_mask = batch["attention_mask"]
         base_h = batch["hidden_states"]
@@ -4687,6 +4783,9 @@ class DrafterBaseTrainer:
             "loss_mask": loss_mask,
             "position_ids": position_ids,
         }
+        if label_ids is not None:
+            batch["label_ids"] = label_ids
+            batch["label_mask"] = label_mask
 
         if self.backend.model_type == "eagle3":
             if use_logits:
@@ -5200,6 +5299,19 @@ class DrafterBaseTrainer:
                 f"tokens={float(global_tokens.detach().float().item())}"
             )
             return False
+
+        if self.backend.model_type in {
+            "eagle3",
+            "dflash",
+            "dspark",
+            "dflash2",
+        } and getattr(self.backend, "enable_standalone_training_metrics", False):
+            # Log the actual globally reduced optimization objective, including
+            # the backend's CE/L1 weights and token normalization.
+            loss_key = f"{self.backend.model_type}/loss"
+            self._training_metric_sums[loss_key] = self._training_metric_sums.get(
+                loss_key, 0.0
+            ) + float(loss.detach().float().item())
 
         # Backward on this rank's local loss sums: the metric all-reduce above is
         # outside the autograd graph, so each rank's backward carries only its own
