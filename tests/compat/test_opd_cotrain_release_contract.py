@@ -110,7 +110,10 @@ def test_drafter_distributed_paths_use_fsdp2_apis() -> None:
     checkpoint_calls = _called_names(_function(tree, "_save_optimizer_checkpoint"))
 
     assert {"apply_fsdp2", "fsdp2_load_full_state_dict"} <= build_calls
-    assert "get_fsdp_full_state_dict" in publish_calls
+    assert "_get_full_model_state_dict" in publish_calls
+    assert "get_fsdp_full_state_dict" in _called_names(
+        _function(tree, "_get_full_model_state_dict")
+    )
     assert "save" in checkpoint_calls
 
 

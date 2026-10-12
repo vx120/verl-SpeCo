@@ -23,7 +23,8 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import PretrainedConfig, PreTrainedModel
 
-from .configuration_dflash import DFlashConfig
+from ..eagle.base import resolve_embedding_key
+from .configuration_dflash import DFlashConfig, resolve_rope_theta
 from .flex_attention import compile_friendly_flex_attention
 
 
@@ -144,7 +145,7 @@ class DFlashAttention(nn.Module):
         self.rotary_emb = DFlashRotaryEmbedding(
             self.head_dim,
             max_position_embeddings=getattr(config, "max_position_embeddings", 32768),
-            base=getattr(config, "rope_theta", 10000.0),
+            base=resolve_rope_theta(config),
         )
 
     def forward(
@@ -248,6 +249,11 @@ class DFlashDecoderLayer(nn.Module):
         self.post_attention_layernorm = DFlashRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        # Optional dynamic-convolution hooks, populated only by DFlash2. Every
+        # other DFlash-family drafter leaves them None, so their forward is
+        # unchanged.
+        self.attention_conv = None
+        self.mlp_conv = None
 
     def forward(
         self,
@@ -260,6 +266,9 @@ class DFlashDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         residual = draft_hidden
         draft_hidden = self.input_layernorm(draft_hidden)
+        attention_kernel = None
+        if self.attention_conv is not None:
+            draft_hidden, attention_kernel = self.attention_conv.prepare(draft_hidden)
         draft_hidden = self.self_attn(
             draft_hidden=draft_hidden,
             context_hidden=context_hidden,
@@ -268,11 +277,18 @@ class DFlashDecoderLayer(nn.Module):
             block_mask=block_mask,
             dense_attention_mask=dense_attention_mask,
         )
+        if attention_kernel is not None:
+            draft_hidden = self.attention_conv.finish(draft_hidden, attention_kernel)
         draft_hidden = residual + draft_hidden
 
         residual = draft_hidden
         draft_hidden = self.post_attention_layernorm(draft_hidden)
+        mlp_kernel = None
+        if self.mlp_conv is not None:
+            draft_hidden, mlp_kernel = self.mlp_conv.prepare(draft_hidden)
         draft_hidden = self.mlp(draft_hidden)
+        if mlp_kernel is not None:
+            draft_hidden = self.mlp_conv.finish(draft_hidden, mlp_kernel)
         return residual + draft_hidden
 
 
@@ -367,7 +383,17 @@ class DFlashDraftModel(PreTrainedModel):
         else:
             draft_hidden = self.embed_tokens(draft_input_ids).to(context_feature.dtype)
 
-        for layer in self.layers:
+        block_masks = block_mask if isinstance(block_mask, list) else None
+        dense_masks = (
+            dense_attention_mask if isinstance(dense_attention_mask, list) else None
+        )
+        for index, layer in enumerate(self.layers):
+            layer_block_mask = (
+                block_masks[index] if block_masks is not None else block_mask
+            )
+            layer_dense_mask = (
+                dense_masks[index] if dense_masks is not None else dense_attention_mask
+            )
             if (
                 self.gradient_checkpointing
                 and self.training
@@ -380,14 +406,16 @@ class DFlashDraftModel(PreTrainedModel):
                     draft_positions,
                     context_positions,
                     current_layer=layer,
+                    current_block_mask=layer_block_mask,
+                    current_dense_mask=layer_dense_mask,
                 ):
                     return current_layer(
                         draft_hidden=hidden,
                         context_hidden=context,
                         draft_position_ids=draft_positions,
                         context_position_ids=context_positions,
-                        block_mask=block_mask,
-                        dense_attention_mask=dense_attention_mask,
+                        block_mask=current_block_mask,
+                        dense_attention_mask=current_dense_mask,
                     )
 
                 draft_hidden = checkpoint(
@@ -404,8 +432,8 @@ class DFlashDraftModel(PreTrainedModel):
                     context_hidden=context_feature,
                     draft_position_ids=draft_position_ids,
                     context_position_ids=context_position_ids,
-                    block_mask=block_mask,
-                    dense_attention_mask=dense_attention_mask,
+                    block_mask=layer_block_mask,
+                    dense_attention_mask=layer_dense_mask,
                 )
         return self.norm(draft_hidden)
 
@@ -418,6 +446,8 @@ class DFlashDraftModel(PreTrainedModel):
     ) -> None:
         if not os.path.exists(model_path):
             model_path = snapshot_download(repo_id=model_path)
+        # Multimodal / MoE targets nest the text embedding under a different key.
+        embedding_key = resolve_embedding_key(model_path, embedding_key)
 
         import glob as glob_mod
 

@@ -15,6 +15,7 @@ set -x
 
 project_name='verl_grpo_example_eagle3_drafter'
 exp_name='qwen3_8b_eagle3_separate_drafter_vllm_gpu'
+TRAIN_LOGGERS=${TRAIN_LOGGERS:-'["console","swanlab"]'}
 
 gen_tp=2
 train_sp=1
@@ -22,6 +23,8 @@ ppo_gpus_per_node=8
 draft_train_gpus_per_node=8
 ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
+feature_store_min_sample_step=${SPECO_FEATURE_STORE_MIN_SAMPLE_STEP:-3}
+feature_store_max_sample_step=${SPECO_FEATURE_STORE_MAX_SAMPLE_STEP:-5}
 
 MODEL_PATH=/path/to/model
 CKPTS_DIR=/path/to/checkpoint
@@ -135,7 +138,12 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.draft_train_launcher \
     actor_rollout_ref.rollout.drafter.training.use_logits=False \
     actor_rollout_ref.rollout.drafter.training.feature_store.type=torch_shard \
     actor_rollout_ref.rollout.drafter.training.feature_store.path=${FEATURE_STORE_DIR} \
+    actor_rollout_ref.rollout.drafter.training.feature_store.min_sample_step=${feature_store_min_sample_step} \
+    actor_rollout_ref.rollout.drafter.training.feature_store.max_sample_step=${feature_store_max_sample_step} \
     actor_rollout_ref.rollout.drafter.training.feature_store.shuffle=True \
     actor_rollout_ref.rollout.drafter.training.feature_store.repeat=True \
+    trainer.logger="${TRAIN_LOGGERS}" \
+    trainer.project_name=${project_name} \
+    trainer.experiment_name=${exp_name}_train \
     actor_rollout_ref.rollout.drafter.training.feature_store.strict_schema=True $@
 fi
