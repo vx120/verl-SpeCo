@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Synchronous OPD + online DFlash co-training | vLLM rollout | FSDP2 | NVIDIA GPUs
+# OPD teacher inference overlaps online DSpark training | vLLM rollout | FSDP2 | NVIDIA GPUs
 
 set -xeuo pipefail
 
 STUDENT_MODEL=${STUDENT_MODEL:-Qwen/Qwen3-8B}
 TEACHER_MODEL=${TEACHER_MODEL:-Qwen/Qwen3-32B}
-DRAFTER_MODEL=${DRAFTER_MODEL:-/path/to/vllm-compatible-dflash-drafter}
+DRAFTER_MODEL=${DRAFTER_MODEL:-/path/to/vllm-compatible-dspark-drafter}
 TRAIN_FILES=${TRAIN_FILES:-/path/to/train.parquet}
 VAL_FILES=${VAL_FILES:-/path/to/validation.parquet}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-/path/to/checkpoints}
@@ -61,12 +61,26 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.enable=True \
     actor_rollout_ref.rollout.drafter.enable_drafter_training=True \
     actor_rollout_ref.rollout.drafter.model_path="${DRAFTER_MODEL}" \
-    actor_rollout_ref.rollout.drafter.speculative_algorithm=DFLASH \
+    actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK \
     actor_rollout_ref.rollout.drafter.training.mode=online \
     actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_sgl=False \
     actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_old_logprob=True \
     actor_rollout_ref.rollout.drafter.training.old_logprob_hidden_capture_impl=forward_hook \
     actor_rollout_ref.rollout.drafter.training.use_logits=False \
+    actor_rollout_ref.rollout.drafter.training.dspark_block_size=7 \
+    actor_rollout_ref.rollout.drafter.training.dspark_num_anchors=64 \
+    actor_rollout_ref.rollout.drafter.training.dspark_max_window=512 \
+    actor_rollout_ref.rollout.drafter.training.dspark_loss_mode=restricted_ce \
+    actor_rollout_ref.rollout.drafter.training.dspark_loss_decay_gamma=7 \
+    actor_rollout_ref.rollout.drafter.training.dspark_hard_sample_ratio=0.3 \
+    actor_rollout_ref.rollout.drafter.training.dspark_num_target_layers=5 \
+    actor_rollout_ref.rollout.drafter.training.dspark_num_hidden_layers=5 \
+    actor_rollout_ref.rollout.drafter.training.dspark_markov_rank=256 \
+    actor_rollout_ref.rollout.drafter.training.dspark_markov_head_type=vanilla \
+    actor_rollout_ref.rollout.drafter.training.target_lm_head_row_restricted_sync=False \
+    actor_rollout_ref.rollout.drafter.training.dspark_ce_loss_alpha=0.1 \
+    actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=0.9 \
+    actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha=0.0 \
     actor_rollout_ref.rollout.drafter.training.step=10 \
     actor_rollout_ref.rollout.drafter.training.collect_interval_steps=5 \
     actor_rollout_ref.rollout.drafter.training.training_interval_steps=5 \
@@ -76,7 +90,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.draft_update_flush_after=True \
     actor_rollout_ref.rollout.drafter.rollout.spec_steps=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_topk=1 \
-    actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=16 \
+    actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=7 \
     distillation.enabled=True \
     distillation.n_gpus_per_node=${TEACHER_WORLD_SIZE} \
     distillation.nnodes=${NNODES} \
@@ -94,7 +108,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     trainer.balance_batch=True \
     trainer.logger='["console","wandb"]' \
     trainer.project_name=verl_speco_opd_cotrain \
-    trainer.experiment_name=qwen3_8b_opd_dflash_vllm_fsdp2 \
+    trainer.experiment_name=qwen3_8b_opd_dspark_vllm_fsdp2 \
     trainer.n_gpus_per_node=${NGPUS_PER_NODE} \
     trainer.nnodes=${NNODES} \
     trainer.val_before_train=False \

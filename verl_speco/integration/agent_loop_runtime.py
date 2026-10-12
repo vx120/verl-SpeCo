@@ -22,6 +22,9 @@ import types
 from functools import wraps
 from typing import Any, cast
 
+from verl_speco.integration.opd_cotrain import distillation_enabled, opd_cotrain_enabled
+from verl_speco.integration.opd_teacher_runtime import install_opd_teacher_worker_patch
+
 logger = logging.getLogger(__file__)
 
 _PATCHED = False
@@ -277,8 +280,11 @@ except Exception:  # noqa: BLE001
     _UpstreamAgentLoopManager = object
 
 
-def _build_speco_agent_loop_worker_class(worker_cls):
-    speco_worker_cls = getattr(worker_cls, "_speco_remote_worker_cls", None)
+def _build_speco_agent_loop_worker_class(worker_cls, *, opd_cotrain=False):
+    cache_key = (
+        "_speco_remote_opd_worker_cls" if opd_cotrain else "_speco_remote_worker_cls"
+    )
+    speco_worker_cls = getattr(worker_cls, cache_key, None)
     if speco_worker_cls is not None and getattr(
         speco_worker_cls, "_speco_explicit_worker_runtime", False
     ):
@@ -294,6 +300,10 @@ def _build_speco_agent_loop_worker_class(worker_cls):
         "__doc__": "Ray-serializable AgentLoopWorker subclass carrying SPECO runtime patches.",
         "__init__": _speco_worker_init,
         "_speco_explicit_worker_runtime": True,
+        "_speco_opd_cotrain": opd_cotrain,
+        "_compute_teacher_logprobs": worker_cls._compute_teacher_logprobs,
+        "_speco_original_compute_teacher_logprobs": worker_cls._speco_original_compute_teacher_logprobs,
+        "compute_opd_teacher": worker_cls.compute_opd_teacher,
     }
     if callable(generate_sequences):
         attrs["generate_sequences"] = _speco_worker_generate_sequences
@@ -306,12 +316,16 @@ def _build_speco_agent_loop_worker_class(worker_cls):
 
     speco_worker_cls = type("SpecoAgentLoopWorker", (worker_cls,), attrs)
     speco_worker_cls.__qualname__ = "SpecoAgentLoopWorker"
-    worker_cls._speco_remote_worker_cls = speco_worker_cls
+    setattr(worker_cls, cache_key, speco_worker_cls)
     return speco_worker_cls
 
 
 def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) -> None:
-    if not _is_sglang_rollout_config(getattr(manager, "config", None)):
+    is_sglang = _is_sglang_rollout_config(getattr(manager, "config", None))
+    opd_parallel = getattr(manager, "_speco_opd_cotrain", False) or opd_cotrain_enabled(
+        manager.config
+    )
+    if not (is_sglang or opd_parallel):
         return
     if getattr(manager, "_speco_agent_loop_manager_configured", False):
         return
@@ -319,11 +333,16 @@ def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) 
     import ray
 
     manager.agent_loop_workers_class = ray.remote(
-        _build_speco_agent_loop_worker_class(worker_cls)
+        _build_speco_agent_loop_worker_class(worker_cls, opd_cotrain=opd_parallel)
     )
+
+    if not is_sglang:
+        manager._speco_agent_loop_manager_configured = True
+        return
 
     try:
         from verl.workers.rollout.sglang_rollout import async_sglang_server
+
         from verl_speco.integration.sglang_runtime import (
             _build_speco_replica_class,
             patch_sglang_server_adapter_update,
@@ -339,7 +358,7 @@ def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) 
     logger.warning(
         "SPECO AgentLoopManager bridge active for SGLang rollout: worker_class=%s rollout_replica_class=%s",
         getattr(
-            _build_speco_agent_loop_worker_class(worker_cls),
+            _build_speco_agent_loop_worker_class(worker_cls, opd_cotrain=opd_parallel),
             "__name__",
             type(worker_cls).__name__,
         ),
@@ -351,9 +370,13 @@ def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) 
 _UpstreamAgentLoopManagerBase = cast(type[Any], _UpstreamAgentLoopManager)
 
 
-def _speco_agent_loop_manager_init(self, *args, **kwargs):
+def _speco_agent_loop_manager_init(self, config, *args, **kwargs):
     install_agent_loop_runtime_patch()
-    _UpstreamAgentLoopManagerBase.__init__(self, *args, **kwargs)
+    # This manager is selected only for online drafter training. Upstream worker
+    # initialization temporarily hides drafter config, so carry the OPD flag on
+    # the explicit worker class rather than relying on the serialized config.
+    self._speco_opd_cotrain = distillation_enabled(config)
+    _UpstreamAgentLoopManagerBase.__init__(self, config, *args, **kwargs)
     agent_loop_module = _AgentLoopModule or _load_agent_loop_module()
     worker_cls = getattr(agent_loop_module, "AgentLoopWorker")
     _configure_speco_agent_loop_manager_instance(self, worker_cls)
@@ -428,6 +451,8 @@ def install_agent_loop_runtime_patch() -> bool:
 
         llm_server_client_cls.generate = speco_llm_server_generate
         llm_server_client_cls._speco_patched_generate = True
+
+    install_opd_teacher_worker_patch(worker_cls)
 
     if not getattr(worker_cls, "_speco_patched_generate_sequences", False):
 

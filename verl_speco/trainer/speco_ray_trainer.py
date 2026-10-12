@@ -31,15 +31,16 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.utils import Role
 from verl.utils import tensordict_utils as tu
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
 from verl_speco.integration.agent_loop_runtime import (
     SPECO_AGENT_LOOP_MANAGER_CLASS,
     install_agent_loop_runtime_patch,
 )
-from verl_speco.integration.opd_cotrain import (
-    detach_student_feature,
-    student_policy_batch_keys,
+from verl_speco.integration.oldlogprob_layer_ids import (
+    assert_sglang_aux_last_layer_norm_safe,
+    resolve_drafter_hidden_states_layout,
+    resolve_oldlogprob_aux_layer_ids,
 )
-from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
 from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_AUX_LAYER_ID_SPACE_KEY,
     OLD_LOGPROB_AUX_LAYER_IDS_KEY,
@@ -47,8 +48,8 @@ from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY,
     OLD_LOGPROB_HIDDEN_CHUNK_META_KEY,
     OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
-    OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY,
     OLD_LOGPROB_HIDDEN_LAYOUT_KEY,
+    OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY,
     OLD_LOGPROB_HIDDEN_POSITION_MASK_KEY,
     OLD_LOGPROB_HIDDEN_POSITIONS_KEY,
     OLD_LOGPROB_HIDDEN_REF_META_KEY,
@@ -59,11 +60,13 @@ from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_OWNER_RANK_KEY,
     OLD_LOGPROB_TIMING_KEY,
 )
-from verl_speco.integration.oldlogprob_layer_ids import (
-    assert_sglang_aux_last_layer_norm_safe,
-    resolve_drafter_hidden_states_layout,
-    resolve_oldlogprob_aux_layer_ids,
+from verl_speco.integration.opd_cotrain import (
+    detach_student_feature,
+    opd_cotrain_enabled,
+    student_policy_batch_keys,
 )
+from verl_speco.integration.opd_teacher_runtime import parallel_opd_teacher_inference
+from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
 from verl_speco.integration.sglang_adapter import pop_drafter_samples
 from verl_speco.integration.sglang_runtime import (
     clear_sglang_runtime_config,
@@ -83,9 +86,9 @@ from verl_speco.trainer.scheduler import (
     CallbackDrafterCollectionExecutor,
     CallbackDrafterPublishExecutor,
     CallbackDrafterWorkerExecutor,
-    CollectionPlan,
-    CollectionPayload,
     CollectionOutcome,
+    CollectionPayload,
+    CollectionPlan,
     DrafterCollectionContext,
     DrafterCollectionSource,
     DrafterRuntimeState,
@@ -96,7 +99,6 @@ from verl_speco.trainer.scheduler import (
     TrainingPlan,
 )
 from verl_speco.workers import SpecoWorker
-
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -2533,10 +2535,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             )
             return old_log_prob, old_log_prob_mfu
 
-        def update_actor_with_speco(trainer_self, *args, **kwargs):
+        def update_actor_with_speco(trainer_self, batch: DataProto):
             update_actor_started = time.perf_counter()
-            pending_target_lm_head_sync = None
-            metrics = {
+            metrics: dict[str, Any] = {
                 "drafter/raw_drafter_samples": int(
                     getattr(self, "_speco_last_raw_drafter_samples", 0)
                 ),
@@ -2553,45 +2554,54 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             collection_outcome = getattr(self, "_speco_last_collection_outcome", None)
             if isinstance(collection_outcome, CollectionOutcome):
                 metrics.update(collection_outcome.metrics())
-            before_actor_event = self._speco_on_before_actor_update()
-            training_plan = before_actor_event.training_plan
-            if training_plan is None:
-                raise RuntimeError(
-                    "Drafter before-actor-update event returned no training plan"
+
+            def prepare_drafter_training():
+                before_actor_event = self._speco_on_before_actor_update()
+                training_plan = before_actor_event.training_plan
+                self._speco_log_drafter_training_plan(training_plan)
+                metrics.update(before_actor_event.metrics or {})
+                metrics["drafter/train_interval_matched"] = int(
+                    training_plan.interval_matched
                 )
-            self._speco_log_drafter_training_plan(training_plan)
-            metrics.update(before_actor_event.metrics or {})
-            metrics["drafter/train_interval_matched"] = int(
-                training_plan.interval_matched
-            )
-            actor_started = time.perf_counter()
-            actor_output = original_update_actor(*args, **kwargs)
-            actor_elapsed = time.perf_counter() - actor_started
-            pending_target_lm_head_sync = self._pending_target_lm_head_sync
-            self._pending_target_lm_head_sync = None
-            if pending_target_lm_head_sync is not None:
-                metrics.update(
-                    self._speco_finish_target_lm_head_weight_sync(
-                        pending_target_lm_head_sync
+                return training_plan
+
+            def train_drafter(training_plan):
+                pending_sync = self._pending_target_lm_head_sync
+                self._pending_target_lm_head_sync = None
+                if pending_sync is not None:
+                    metrics.update(
+                        self._speco_finish_target_lm_head_weight_sync(pending_sync)
                     )
-                )
-            if training_plan.launch:
-                drafter_trained, train_metrics = self._speco_train_drafter(
-                    training_plan
-                )
-            else:
-                drafter_trained, train_metrics = (
-                    False,
-                    {
-                        "drafter/trained": 0,
-                        "drafter/train_successful_steps_max": 0,
-                        "drafter/train_no_trainable_batch": int(
-                            training_plan.reason == "no_trainable_batch"
-                        ),
-                        "drafter/train_activation_failed": 0,
-                    },
-                )
+                if training_plan.launch:
+                    return self._speco_train_drafter(training_plan)
+                train_metrics = {
+                    "drafter/trained": 0,
+                    "drafter/train_successful_steps_max": 0,
+                    "drafter/train_no_trainable_batch": int(
+                        training_plan.reason == "no_trainable_batch"
+                    ),
+                    "drafter/train_activation_failed": 0,
+                }
                 train_metrics.update(self._speco_get_drafter_runtime_state().metrics())
+                return False, train_metrics
+
+            parallel_teacher = opd_cotrain_enabled(self.config)
+            if parallel_teacher:
+                with parallel_opd_teacher_inference(
+                    batch,
+                    rollout_generation_target.agent_loop_workers,
+                    self._ray_get_if_needed,
+                ) as teacher_metrics:
+                    training_plan = prepare_drafter_training()
+                    drafter_trained, train_metrics = train_drafter(training_plan)
+                metrics.update(teacher_metrics)
+            else:
+                training_plan = prepare_drafter_training()
+            actor_started = time.perf_counter()
+            actor_output = original_update_actor(batch)
+            actor_elapsed = time.perf_counter() - actor_started
+            if not parallel_teacher:
+                drafter_trained, train_metrics = train_drafter(training_plan)
             metrics.update(train_metrics)
             if defer_publish_until_update_weights and drafter_trained:
                 pending_drafter_publish["ready"] = True
@@ -2612,6 +2622,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "timing_s/drafter_publish_wait_pending",
                 "timing_s/drafter_publish_fetch_snapshot",
                 "timing_s/drafter_publish_update_weights",
+                "timing_s/opd_teacher_wait",
             ):
                 value = _speco_metric_float(metrics.get(key))
                 if value is not None:
