@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from verl_speco.backends.dflash_trainer_backend import (
     DFlashTrainerBackend,
@@ -59,7 +60,10 @@ class DSparkTrainingModel(DFlashTrainingModel):
         ce_loss_alpha: float = 0.1,
         l1_loss_alpha: float = 0.9,
         confidence_head_alpha: float = 0.0,
-        l1_chunk_size: int = 0,
+        l1_chunk_size: int = 128,
+        full_vocab_chunk_size: int = 128,
+        checkpoint_loss_chunks: bool = True,
+        gradient_checkpointing: bool = True,
         debug_log: bool = False,
         debug_log_first_n: int = 2,
         debug_log_interval: int = 100,
@@ -78,6 +82,9 @@ class DSparkTrainingModel(DFlashTrainingModel):
         self.l1_loss_alpha = float(l1_loss_alpha)
         self.confidence_head_alpha = float(confidence_head_alpha)
         self.l1_chunk_size = int(l1_chunk_size or 0)
+        self.full_vocab_chunk_size = int(full_vocab_chunk_size or 0)
+        self.checkpoint_loss_chunks = bool(checkpoint_loss_chunks)
+        self.draft_model.gradient_checkpointing = bool(gradient_checkpointing)
         if self.confidence_head_alpha > 0:
             raise NotImplementedError(
                 "DSpark confidence loss needs target acceptance targets from target logits; "
@@ -93,6 +100,14 @@ class DSparkTrainingModel(DFlashTrainingModel):
         self.debug_log_first_n = max(int(debug_log_first_n), 0)
         self.debug_log_interval = max(int(debug_log_interval), 1)
         self._debug_forward_count = 0
+        logger.info(
+            "[dspark-trainer] loss_mode=%s l1_chunk_size=%s "
+            "full_vocab_chunk_size=%s checkpoint_loss_chunks=%s",
+            self.loss_mode,
+            self.l1_chunk_size,
+            self.full_vocab_chunk_size,
+            self.checkpoint_loss_chunks,
+        )
 
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
@@ -248,6 +263,101 @@ class DSparkTrainingModel(DFlashTrainingModel):
             ),
         )
 
+    def _run_checkpointed_loss_chunk(self, function, *args):
+        """Run a loss chunk without retaining its full-vocabulary intermediates."""
+        should_checkpoint = (
+            self.checkpoint_loss_chunks and self.training and torch.is_grad_enabled()
+        )
+        if not should_checkpoint:
+            return function(*args)
+        return checkpoint(function, *args, use_reentrant=False)
+
+    def _compute_full_vocab_ce_for_active(
+        self,
+        *,
+        active_hidden: torch.Tensor,
+        active_prev_tokens: torch.Tensor,
+        active_targets: torch.Tensor,
+        active_weights: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Compute exact full-vocabulary CE with row-chunked recomputation."""
+        active_count = int(active_hidden.size(0))
+        chunk_size = (
+            self.full_vocab_chunk_size
+            if self.full_vocab_chunk_size > 0
+            else active_count
+        )
+        topk = min(5, int(lm_head_weight.size(0)))
+        ce_sum = active_weights.new_zeros((), dtype=torch.float32)
+        losses: list[torch.Tensor] = []
+        finite_masks: list[torch.Tensor] = []
+        predictions: list[torch.Tensor] = []
+        top_predictions: list[torch.Tensor] = []
+
+        def compute_chunk(
+            hidden_chunk: torch.Tensor,
+            prev_chunk: torch.Tensor,
+            target_chunk: torch.Tensor,
+            weights_chunk: torch.Tensor,
+            head_weight: torch.Tensor,
+        ):
+            logits = F.linear(hidden_chunk, head_weight)
+            markov_bias = self._markov_bias_for_active(
+                active_hidden=hidden_chunk,
+                active_prev_tokens=prev_chunk,
+                restricted_vocab=None,
+            )
+            if markov_bias is not None:
+                logits = logits + markov_bias
+            log_probs = F.log_softmax(logits.float(), dim=-1)
+            chunk_loss = F.nll_loss(log_probs, target_chunk, reduction="none")
+            finite = torch.isfinite(chunk_loss)
+            safe_loss = torch.where(finite, chunk_loss, torch.zeros_like(chunk_loss))
+            safe_weights = weights_chunk.float() * finite.to(weights_chunk.dtype)
+            weighted_sum = (safe_loss * safe_weights).sum()
+            with torch.no_grad():
+                pred_tokens = logits.argmax(dim=-1)
+                top_tokens = logits.topk(topk, dim=-1).indices
+            return (
+                weighted_sum,
+                safe_loss.detach(),
+                finite.detach(),
+                pred_tokens.detach(),
+                top_tokens.detach(),
+            )
+
+        for start in range(0, active_count, chunk_size):
+            end = min(start + chunk_size, active_count)
+            chunk_result = self._run_checkpointed_loss_chunk(
+                compute_chunk,
+                active_hidden[start:end],
+                active_prev_tokens[start:end],
+                active_targets[start:end],
+                active_weights[start:end],
+                lm_head_weight,
+            )
+            chunk_sum, chunk_loss, finite, pred_tokens, top_tokens = chunk_result
+            ce_sum = ce_sum + chunk_sum
+            losses.append(chunk_loss)
+            finite_masks.append(finite)
+            predictions.append(pred_tokens)
+            top_predictions.append(top_tokens)
+
+        return (
+            ce_sum,
+            torch.cat(losses, dim=0),
+            torch.cat(finite_masks, dim=0),
+            torch.cat(predictions, dim=0),
+            torch.cat(top_predictions, dim=0),
+        )
+
     def _compute_l1_loss_for_active(
         self,
         *,
@@ -281,21 +391,46 @@ class DSparkTrainingModel(DFlashTrainingModel):
             weights_chunk = active_weights[start:end].float()
 
             if active_draft_log_probs is None:
-                draft_logits = F.linear(hidden_chunk, lm_head_weight)
-                markov_bias = self._markov_bias_for_active(
-                    active_hidden=hidden_chunk,
-                    active_prev_tokens=prev_chunk,
-                    restricted_vocab=None,
+
+                def compute_chunk(
+                    draft_hidden_chunk: torch.Tensor,
+                    previous_tokens_chunk: torch.Tensor,
+                    teacher_hidden_chunk: torch.Tensor,
+                    loss_weights_chunk: torch.Tensor,
+                    head_weight: torch.Tensor,
+                ) -> torch.Tensor:
+                    draft_logits = F.linear(draft_hidden_chunk, head_weight)
+                    markov_bias = self._markov_bias_for_active(
+                        active_hidden=draft_hidden_chunk,
+                        active_prev_tokens=previous_tokens_chunk,
+                        restricted_vocab=None,
+                    )
+                    if markov_bias is not None:
+                        draft_logits = draft_logits + markov_bias
+                    draft_probs = torch.softmax(draft_logits.float(), dim=-1)
+                    target_logits = F.linear(teacher_hidden_chunk, head_weight)
+                    target_probs = torch.softmax(target_logits.float(), dim=-1)
+                    l1_dist = (draft_probs - target_probs).abs().sum(dim=-1)
+                    return (l1_dist * loss_weights_chunk.float()).sum()
+
+                chunk_l1_sum = self._run_checkpointed_loss_chunk(
+                    compute_chunk,
+                    hidden_chunk,
+                    prev_chunk,
+                    target_hidden_chunk,
+                    weights_chunk,
+                    lm_head_weight,
                 )
-                if markov_bias is not None:
-                    draft_logits = draft_logits + markov_bias
-                draft_probs = torch.softmax(draft_logits.float(), dim=-1)
             else:
+                # Retained for callers that explicitly provide precomputed
+                # probabilities. The online path intentionally recomputes L1
+                # chunks so full-vocabulary tensors do not survive the forward.
                 draft_probs = active_draft_log_probs[start:end].exp()
-            target_logits = F.linear(target_hidden_chunk, lm_head_weight)
-            target_probs = torch.softmax(target_logits.float(), dim=-1)
-            l1_dist = (draft_probs - target_probs).abs().sum(dim=-1)
-            l1_sum = l1_sum + (l1_dist * weights_chunk).sum()
+                target_logits = F.linear(target_hidden_chunk, lm_head_weight)
+                target_probs = torch.softmax(target_logits.float(), dim=-1)
+                l1_dist = (draft_probs - target_probs).abs().sum(dim=-1)
+                chunk_l1_sum = (l1_dist * weights_chunk).sum()
+            l1_sum = l1_sum + chunk_l1_sum
         return l1_sum, l1_den
 
     def _should_debug_log(self) -> bool:
@@ -459,7 +594,9 @@ class DSparkTrainingModel(DFlashTrainingModel):
         local_l1_sum = torch.zeros((), dtype=torch.float32, device=device)
         local_l1_den = torch.zeros((), dtype=torch.float32, device=device)
         active_logits = None
-        active_log_probs = None
+        active_pred_tokens = None
+        active_top_tokens = None
+        checkpointed_ce_sum = None
         restricted_vocab = None
         if active_targets.numel() == 0:
             loss = flat_weights.sum() * 0.0
@@ -482,20 +619,22 @@ class DSparkTrainingModel(DFlashTrainingModel):
                     active_logits, active_ce_targets, reduction="none"
                 )
             else:
-                active_logits = F.linear(active_hidden, lm_head_weight)
-                markov_bias = self._markov_bias_for_active(
+                (
+                    checkpointed_ce_sum,
+                    active_loss,
+                    finite_loss,
+                    active_pred_tokens,
+                    active_top_tokens,
+                ) = self._compute_full_vocab_ce_for_active(
                     active_hidden=active_hidden,
                     active_prev_tokens=active_prev_tokens,
-                    restricted_vocab=None,
-                )
-                if markov_bias is not None:
-                    active_logits = active_logits + markov_bias
-                active_log_probs = F.log_softmax(active_logits.float(), dim=-1)
-                active_loss = F.nll_loss(
-                    active_log_probs, active_targets, reduction="none"
+                    active_targets=active_targets,
+                    active_weights=active_weights,
+                    lm_head_weight=lm_head_weight,
                 )
 
-            finite_loss = torch.isfinite(active_loss)
+            if restricted_vocab is not None:
+                finite_loss = torch.isfinite(active_loss)
             sanitized_rows = (~finite_loss).sum().to(dtype=torch.float32)
             active_loss = torch.where(
                 finite_loss, active_loss, torch.zeros_like(active_loss)
@@ -506,7 +645,11 @@ class DSparkTrainingModel(DFlashTrainingModel):
             loss_per_token[active_mask] = active_loss
             local_ce_den = active_loss_weights.sum()
             valid_token_count = local_ce_den.clamp(min=1e-6)
-            local_ploss_sum = (active_loss * active_loss_weights).sum()
+            local_ploss_sum = (
+                checkpointed_ce_sum
+                if checkpointed_ce_sum is not None
+                else (active_loss * active_loss_weights).sum()
+            )
             ce_loss = local_ploss_sum / valid_token_count
             if self.l1_loss_alpha > 0:
                 if active_target_hidden is None:
@@ -517,24 +660,12 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 finite_target_hidden = torch.isfinite(active_target_hidden).all(dim=-1)
                 l1_mask = finite_loss & finite_target_hidden
                 if l1_mask.any():
-                    reusable_draft_log_probs = None
-                    # Full-vocab CE already normalizes the complete LM head and Markov bias.
-                    # Restricted CE must build separate full-vocab probabilities for L1.
-                    if restricted_vocab is None:
-                        if active_log_probs is None:
-                            raise ValueError("DSpark L1 loss requires active_log_probs")
-                        reusable_draft_log_probs = (
-                            active_log_probs
-                            if l1_mask.all()
-                            else active_log_probs[l1_mask]
-                        )
                     local_l1_sum, local_l1_den = self._compute_l1_loss_for_active(
                         active_hidden=active_hidden[l1_mask],
                         active_prev_tokens=active_prev_tokens[l1_mask],
                         active_target_hidden=active_target_hidden[l1_mask],
                         active_weights=active_loss_weights[l1_mask],
                         lm_head_weight=lm_head_weight,
-                        active_draft_log_probs=reusable_draft_log_probs,
                     )
                 l1_loss = local_l1_sum / local_l1_den.clamp(min=1e-6)
             else:
@@ -555,8 +686,11 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 dtype=torch.float32,
                 device=device,
             )
-            if active_logits is not None and active_targets.numel() > 0:
-                if restricted_vocab is not None:
+            if active_targets.numel() > 0:
+                if active_pred_tokens is not None and active_top_tokens is not None:
+                    pred_tokens = active_pred_tokens
+                    top_tokens = active_top_tokens
+                elif active_logits is not None and restricted_vocab is not None:
                     pred_local = active_logits.argmax(dim=-1)
                     pred_tokens = restricted_vocab[pred_local]
                     topk = min(5, int(restricted_vocab.numel()))
@@ -564,9 +698,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
                         active_logits.topk(topk, dim=-1).indices
                     ]
                 else:
-                    pred_tokens = active_logits.argmax(dim=-1)
-                    topk = min(5, active_logits.shape[-1])
-                    top_tokens = active_logits.topk(topk, dim=-1).indices
+                    raise RuntimeError("DSpark predictions were not computed")
                 active_correct = pred_tokens.eq(active_targets)
                 correct[active_mask] = active_correct
                 top1_correct = active_correct.float().sum()
@@ -628,6 +760,24 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 {"full_vocab": 0.0, "restricted_ce": 1.0, "sampled_ce": 2.0}.get(
                     self.loss_mode, 0.0
                 ),
+                dtype=torch.float32,
+                device=device,
+            ),
+            "l1_chunk_size": torch.tensor(
+                float(self.l1_chunk_size), dtype=torch.float32, device=device
+            ),
+            "full_vocab_chunk_size": torch.tensor(
+                float(self.full_vocab_chunk_size),
+                dtype=torch.float32,
+                device=device,
+            ),
+            "checkpoint_loss_chunks": torch.tensor(
+                float(self.checkpoint_loss_chunks),
+                dtype=torch.float32,
+                device=device,
+            ),
+            "gradient_checkpointing": torch.tensor(
+                float(bool(self.draft_model.gradient_checkpointing)),
                 dtype=torch.float32,
                 device=device,
             ),
@@ -842,7 +992,16 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             confidence_head_alpha=float(
                 training_cfg.get("dspark_confidence_loss_alpha", 0.0)
             ),
-            l1_chunk_size=int(training_cfg.get("dspark_l1_chunk_size", 0)),
+            l1_chunk_size=int(training_cfg.get("dspark_l1_chunk_size", 128)),
+            full_vocab_chunk_size=int(
+                training_cfg.get("dspark_full_vocab_chunk_size", 128)
+            ),
+            checkpoint_loss_chunks=bool(
+                training_cfg.get("dspark_checkpoint_loss_chunks", True)
+            ),
+            gradient_checkpointing=bool(
+                training_cfg.get("dspark_gradient_checkpointing", True)
+            ),
             debug_log=bool(training_cfg.get("dspark_debug_log", False)),
             debug_log_first_n=int(training_cfg.get("dspark_debug_log_first_n", 2)),
             debug_log_interval=int(training_cfg.get("dspark_debug_log_interval", 100)),

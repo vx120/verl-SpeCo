@@ -18,6 +18,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import PretrainedConfig, PreTrainedModel
@@ -282,10 +283,14 @@ class DFlashDraftModel(PreTrainedModel):
     _no_split_modules = ["DFlashDecoderLayer"]
     _tied_weights_keys: list[str] = []
     all_tied_weights_keys: list[str] = []
+    supports_gradient_checkpointing = True
 
     def __init__(self, config: PretrainedConfig):
         super().__init__(config)
         self.config = config
+        self.gradient_checkpointing = bool(
+            getattr(config, "gradient_checkpointing", False)
+        )
         self.hidden_size = config.hidden_size
         self.num_layers = config.num_hidden_layers
         target_num_hidden = int(
@@ -363,14 +368,45 @@ class DFlashDraftModel(PreTrainedModel):
             draft_hidden = self.embed_tokens(draft_input_ids).to(context_feature.dtype)
 
         for layer in self.layers:
-            draft_hidden = layer(
-                draft_hidden=draft_hidden,
-                context_hidden=context_feature,
-                draft_position_ids=draft_position_ids,
-                context_position_ids=context_position_ids,
-                block_mask=block_mask,
-                dense_attention_mask=dense_attention_mask,
-            )
+            if (
+                self.gradient_checkpointing
+                and self.training
+                and torch.is_grad_enabled()
+            ):
+
+                def layer_forward(
+                    hidden,
+                    context,
+                    draft_positions,
+                    context_positions,
+                    current_layer=layer,
+                ):
+                    return current_layer(
+                        draft_hidden=hidden,
+                        context_hidden=context,
+                        draft_position_ids=draft_positions,
+                        context_position_ids=context_positions,
+                        block_mask=block_mask,
+                        dense_attention_mask=dense_attention_mask,
+                    )
+
+                draft_hidden = checkpoint(
+                    layer_forward,
+                    draft_hidden,
+                    context_feature,
+                    draft_position_ids,
+                    context_position_ids,
+                    use_reentrant=False,
+                )
+            else:
+                draft_hidden = layer(
+                    draft_hidden=draft_hidden,
+                    context_hidden=context_feature,
+                    draft_position_ids=draft_position_ids,
+                    context_position_ids=context_position_ids,
+                    block_mask=block_mask,
+                    dense_attention_mask=dense_attention_mask,
+                )
         return self.norm(draft_hidden)
 
     def freeze_embedding(self) -> None:

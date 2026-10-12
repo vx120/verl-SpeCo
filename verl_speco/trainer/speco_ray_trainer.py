@@ -35,6 +35,10 @@ from verl_speco.integration.agent_loop_runtime import (
     SPECO_AGENT_LOOP_MANAGER_CLASS,
     install_agent_loop_runtime_patch,
 )
+from verl_speco.integration.opd_cotrain import (
+    detach_student_feature,
+    student_policy_batch_keys,
+)
 from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
 from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_AUX_LAYER_IDS_KEY,
@@ -51,6 +55,7 @@ from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_HIDDEN_STATES_KEY,
     OLD_LOGPROB_OWNER_RANK_KEY,
     OLD_LOGPROB_TIMING_KEY,
+    oldlogprob_ref_chunks_from_meta,
 )
 from verl_speco.integration.oldlogprob_layer_ids import (
     assert_sglang_aux_last_layer_norm_safe,
@@ -73,6 +78,7 @@ from verl_speco.integration.vllm_runtime import (
     configure_vllm_runtime_from_config,
 )
 from verl_speco.trainer.bubble_profiler import inject_bubble_metrics
+from verl_speco.trainer.drafter_lifecycle import SyncDrafterLifecycle
 from verl_speco.workers import SpecoWorker
 
 
@@ -99,10 +105,14 @@ _POLICY_MODEL_NON_TENSOR_KEYS = {"multi_modal_inputs", "pad_token_id"}
 
 def _select_policy_model_batch(batch: DataProto) -> DataProto:
     """Keep rollout/drafter side-channel data out of policy-model forward paths."""
+    batch_keys = student_policy_batch_keys(batch.batch.keys())
     non_tensor_batch_keys = [
         key for key in _POLICY_MODEL_NON_TENSOR_KEYS if key in batch.non_tensor_batch
     ]
-    return batch.select(non_tensor_batch_keys=non_tensor_batch_keys)
+    return batch.select(
+        batch_keys=batch_keys,
+        non_tensor_batch_keys=non_tensor_batch_keys,
+    )
 
 
 def _get_nested(config, path, default=None):
@@ -389,6 +399,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._pending_drafter_checkpoint_refs = []
         self._speco_last_raw_drafter_samples = 0
         self._speco_last_collected_samples = 0
+        self._speco_buffered_drafter_samples = 0
         self._speco_last_oldlogprob_candidate_samples = 0
         self._speco_last_oldlogprob_planned_samples = 0
         self._speco_last_oldlogprob_collected_samples = 0
@@ -834,8 +845,22 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         training_cfg = self._speco_drafter_training_config()
         return str(training_cfg.get("mode", "online") or "online").strip().lower()
 
+    def _speco_overlap_drafter_training_with_student_update(self) -> bool:
+        training_cfg = self._speco_drafter_training_config()
+        return self._speco_bool_config(
+            training_cfg.get("overlap_with_student_update", False)
+        )
+
     def _speco_has_collected_drafter_samples_this_step(self) -> bool:
         return int(getattr(self, "_speco_last_collected_samples", 0) or 0) > 0
+
+    def _speco_record_buffered_drafter_samples(self, count: int) -> None:
+        self._speco_buffered_drafter_samples = int(
+            getattr(self, "_speco_buffered_drafter_samples", 0) or 0
+        ) + max(int(count), 0)
+
+    def _speco_has_buffered_drafter_samples(self) -> bool:
+        return int(getattr(self, "_speco_buffered_drafter_samples", 0) or 0) > 0
 
     def _speco_should_attempt_drafter_train_this_step(self) -> bool:
         if self._speco_drafter_training_mode() == "collect_only":
@@ -845,9 +870,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if self._speco_has_collected_drafter_samples_this_step():
             return True
         training_cfg = self._speco_drafter_training_config()
-        if self._speco_oldlogprob_collection_requested():
+        if not bool(training_cfg.get("use_data_buffer", False)):
             return False
-        return bool(training_cfg.get("use_data_buffer", False))
+        if self._speco_oldlogprob_collection_requested():
+            return self._speco_has_buffered_drafter_samples()
+        return True
 
     def _speco_set_drafter_global_step(self, *, log_timing: bool = True):
         return self._ray_get_if_needed(self.speco_set_global_step(self.global_steps))
@@ -1125,8 +1152,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if not self._speco_oldlogprob_collection_enabled():
             return None
         if not self._speco_should_collect_drafter_this_step():
-            return None
-        if not self._speco_should_train_drafter_this_step():
             return None
         training_cfg = self._speco_drafter_training_config()
         sample_rate = float(training_cfg.get("collection_sample_rate", 1.0) or 0.0)
@@ -1410,6 +1435,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             hidden_ref = self._speco_sequence_item(hidden_refs, batch_idx)
             ref_meta = self._speco_sequence_item(hidden_ref_meta, batch_idx)
             ref_chunks = sample_ref_chunks.get(batch_idx)
+            if not ref_chunks:
+                ref_chunks = oldlogprob_ref_chunks_from_meta(hidden_ref, ref_meta)
             hidden = hidden_rows[batch_idx] if batch_idx < len(hidden_rows) else None
             if ref_chunks:
                 collected_rows += sum(
@@ -1424,7 +1451,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             elif hidden_ref is None:
                 if hidden is None:
                     continue
-                hidden = hidden[:valid_rows].contiguous()
+                hidden = detach_student_feature(hidden)[:valid_rows].contiguous()
                 if hidden.numel() == 0:
                     continue
                 collected_rows += int(hidden.size(0))
@@ -1460,7 +1487,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 sample["hidden_states_ref_chunks"] = ref_chunks
             elif hidden_ref is None:
                 hidden = cast(torch.Tensor, hidden)
-                sample["hidden_states"] = hidden.detach().cpu().unsqueeze(0)
+                sample["hidden_states"] = hidden.cpu().unsqueeze(0)
             else:
                 sample["hidden_states_ref"] = hidden_ref
                 sample["hidden_states_ref_meta"] = ref_meta
@@ -1475,6 +1502,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_set_drafter_global_step(log_timing=False)
         self._speco_collect_rollout_features_rpc("oldlogprob", buckets)
         self._speco_last_collected_samples = collected
+        self._speco_record_buffered_drafter_samples(collected)
         self._speco_last_oldlogprob_collected_samples = collected
         self._speco_last_oldlogprob_collected_rows = collected_rows
         self._speco_last_oldlogprob_payload_mib = payload_bytes / float(1024 * 1024)
@@ -1517,6 +1545,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_set_drafter_global_step()
         self._speco_collect_rollout_features_rpc("rollout", buckets)
         self._speco_last_collected_samples = len(samples)
+        self._speco_record_buffered_drafter_samples(len(samples))
         return len(samples)
 
     def _speco_owner_route_mapping(self):
@@ -1743,10 +1772,30 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "timing_s/drafter_sync_target_lm_head_apply": apply_elapsed,
         }
 
-    def _speco_train_drafter(self) -> tuple[bool, dict[str, Any]]:
-        train_rpc_started = time.perf_counter()
-        train_results = self._ray_get_if_needed(self.speco_train_drafter()) or []
-        train_rpc_elapsed = time.perf_counter() - train_rpc_started
+    def _speco_start_drafter_training(self) -> dict[str, Any]:
+        started_at = time.perf_counter()
+        refs = self.speco_train_drafter()
+        submitted_at = time.perf_counter()
+        return {
+            "refs": refs,
+            "started_at": started_at,
+            "submitted_at": submitted_at,
+            "submit_elapsed_sec": submitted_at - started_at,
+        }
+
+    def _speco_finish_drafter_training(
+        self, pending: dict[str, Any]
+    ) -> tuple[bool, dict[str, Any]]:
+        wait_started = time.perf_counter()
+        train_results = self._ray_get_if_needed(pending.get("refs")) or []
+        finished_at = time.perf_counter()
+        submit_elapsed = float(pending.get("submit_elapsed_sec", 0.0) or 0.0)
+        wait_elapsed = finished_at - wait_started
+        async_work_elapsed = finished_at - float(
+            pending.get("started_at", wait_started)
+        )
+        train_rpc_elapsed = submit_elapsed + wait_elapsed
+        overlap_window = max(async_work_elapsed - train_rpc_elapsed, 0.0)
         if not isinstance(train_results, list):
             train_results = [train_results]
 
@@ -1815,8 +1864,69 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     "elapsed_sec": "timing_s/drafter_worker_elapsed",
                 }.get(key, key)
                 metrics[metric_key] = max(values)
-        metrics["timing_s/drafter_train_rpc"] = train_rpc_elapsed
+
+        dspark_quality_metric_keys = {
+            "dspark/ce_loss",
+            "dspark/l1_loss",
+            "dspark/top1_acc",
+            "dspark/top5_acc",
+            "dspark/l1_chunk_size",
+            "dspark/full_vocab_chunk_size",
+            "dspark/checkpoint_loss_chunks",
+            "dspark/gradient_checkpointing",
+        }
+        dspark_position_metric_prefixes = (
+            "dspark/accuracy_per_position/",
+            "dspark/loss_per_position/",
+        )
+        for result in normalized_results:
+            for key in result:
+                if key in dspark_quality_metric_keys or any(
+                    key.startswith(prefix) and key.removeprefix(prefix).isdigit()
+                    for prefix in dspark_position_metric_prefixes
+                ):
+                    dspark_quality_metric_keys.add(key)
+        for key in sorted(dspark_quality_metric_keys):
+            values = []
+            for result in normalized_results:
+                value = _speco_metric_float(result.get(key))
+                if value is not None:
+                    values.append(value)
+            if values:
+                metrics[key] = sum(values) / len(values)
+
+        memory_metric_keys = {
+            key
+            for result in normalized_results
+            for key in result
+            if key.startswith("drafter/memory_")
+        }
+        for key in sorted(memory_metric_keys):
+            values = [
+                value
+                for result in normalized_results
+                if (value := _speco_metric_float(result.get(key))) is not None
+            ]
+            if values:
+                # Free memory is constrained by the least-free rank; all other
+                # counters are reported as the worst (largest) Drafter rank.
+                metrics[key] = min(values) if key.endswith("_free_gib") else max(values)
+        metrics.update(
+            {
+                # Preserve this key as driver critical-path time. In synchronous
+                # mode it remains the full RPC duration; in overlap mode it is
+                # only submission plus the tail wait after the Student update.
+                "timing_s/drafter_train_rpc": train_rpc_elapsed,
+                "timing_s/drafter_train_submit": submit_elapsed,
+                "timing_s/drafter_train_wait": wait_elapsed,
+                "timing_s/drafter_train_async_work": async_work_elapsed,
+                "timing_s/drafter_train_overlap_window": overlap_window,
+            }
+        )
         return trained, metrics
+
+    def _speco_train_drafter(self) -> tuple[bool, dict[str, Any]]:
+        return self._speco_finish_drafter_training(self._speco_start_drafter_training())
 
     def _speco_activate_drafter_training_model_before_fit(self) -> None:
         if not self.is_drafter_training_enabled(self.config):
@@ -2112,11 +2222,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         defer_publish_until_update_weights = callable(
             original_checkpoint_update_weights
         )
-        pending_drafter_publish = {
-            "ready": False,
-            "drafter_trained": False,
-            "actor_output": None,
-        }
+        sync_drafter_lifecycle = SyncDrafterLifecycle(
+            defer_publish_until_rollout_weight_sync=defer_publish_until_update_weights,
+            publish_drafter=self._speco_publish_drafter_weights,
+            update_output_metrics=self._speco_update_output_metrics,
+        )
 
         def generate_sequences_with_speco(manager_self, *args, **kwargs):
             self._speco_wait_pending_drafter_publish()
@@ -2160,7 +2270,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_last_oldlogprob_collect_rpc_elapsed_sec = 0.0
             self._speco_last_oldlogprob_total_elapsed_sec = 0.0
             collect_interval_matched = self._speco_should_collect_drafter_this_step()
-            train_interval_matched = self._speco_should_train_drafter_this_step()
             self._speco_last_collect_interval_matched = int(collect_interval_matched)
             prepare_started = time.perf_counter()
             original_batch = batch
@@ -2188,7 +2297,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
                 return old_log_prob, old_log_prob_mfu
 
-            if not collect_interval_matched or not train_interval_matched:
+            if not collect_interval_matched:
                 return compute_old_log_prob_without_collection()
 
             batch = _select_policy_model_batch(batch)
@@ -2283,18 +2392,50 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "drafter/train_interval_matched": int(
                     self._speco_should_train_drafter_this_step()
                 ),
+                "drafter/buffered_samples_before_train": int(
+                    getattr(self, "_speco_buffered_drafter_samples", 0) or 0
+                ),
             }
             should_train_drafter = self._speco_should_attempt_drafter_train_this_step()
+            overlap_drafter_training = bool(
+                should_train_drafter
+                and self._speco_overlap_drafter_training_with_student_update()
+            )
+            pending_drafter_training = None
+            metrics["drafter/train_overlap_with_student_update"] = int(
+                overlap_drafter_training
+            )
             if should_train_drafter:
                 self._speco_set_drafter_global_step()
                 metrics.update(self._speco_sync_target_lm_head_weight())
+                if overlap_drafter_training:
+                    pending_drafter_training = self._speco_start_drafter_training()
             else:
                 metrics["drafter/target_lm_head_synced"] = 0
             actor_started = time.perf_counter()
-            actor_output = original_update_actor(*args, **kwargs)
+            try:
+                actor_output = original_update_actor(*args, **kwargs)
+            except BaseException:
+                if pending_drafter_training is not None:
+                    try:
+                        self._speco_finish_drafter_training(pending_drafter_training)
+                    except Exception:
+                        logger.exception(
+                            "Failed to drain overlapped drafter training after Student update failure"
+                        )
+                raise
             actor_elapsed = time.perf_counter() - actor_started
             if should_train_drafter:
-                drafter_trained, train_metrics = self._speco_train_drafter()
+                if pending_drafter_training is not None:
+                    drafter_trained, train_metrics = (
+                        self._speco_finish_drafter_training(pending_drafter_training)
+                    )
+                else:
+                    drafter_trained, train_metrics = self._speco_train_drafter()
+                if drafter_trained or bool(
+                    train_metrics.get("drafter/train_no_trainable_batch", 0)
+                ):
+                    self._speco_buffered_drafter_samples = 0
             else:
                 drafter_trained, train_metrics = (
                     False,
@@ -2308,12 +2449,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     },
                 )
             metrics.update(train_metrics)
-            if defer_publish_until_update_weights and drafter_trained:
-                pending_drafter_publish["ready"] = True
-                pending_drafter_publish["drafter_trained"] = drafter_trained
-                pending_drafter_publish["actor_output"] = actor_output
-            else:
-                metrics.update(self._speco_publish_drafter_weights(drafter_trained))
+            metrics["drafter/buffered_samples_after_train"] = int(
+                getattr(self, "_speco_buffered_drafter_samples", 0) or 0
+            )
+            metrics.update(
+                sync_drafter_lifecycle.after_student_update(
+                    actor_output=actor_output,
+                    drafter_trained=drafter_trained,
+                )
+            )
             metrics["timing_s/drafter"] = max(
                 0.0, time.perf_counter() - update_actor_started - actor_elapsed
             )
@@ -2336,16 +2480,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         def update_weights_with_speco(manager_self, *args, **kwargs):
             result = original_checkpoint_update_weights(*args, **kwargs)
-            if pending_drafter_publish["ready"]:
-                publish_metrics = self._speco_publish_drafter_weights(
-                    pending_drafter_publish["drafter_trained"]
-                )
-                self._speco_update_output_metrics(
-                    pending_drafter_publish["actor_output"], publish_metrics
-                )
-                pending_drafter_publish["ready"] = False
-                pending_drafter_publish["drafter_trained"] = False
-                pending_drafter_publish["actor_output"] = None
+            sync_drafter_lifecycle.after_student_rollout_weight_sync()
             return result
 
         rollout_generation_target.generate_sequences = MethodType(

@@ -18,7 +18,11 @@ import json
 import pytest
 
 from verl_speco.integration.oldlogprob_runtime import (
+    OLD_LOGPROB_HIDDEN_REF_META_KEY,
+    OLD_LOGPROB_HIDDEN_REFS_KEY,
+    _assign_oldlogprob_worker_side_channel,
     _select_and_merge_concatenated_hidden,
+    oldlogprob_ref_chunks_from_meta,
     oldlogprob_hidden_runtime_enabled,
 )
 from verl_speco.integration.oldlogprob_layer_ids import (
@@ -189,6 +193,74 @@ def test_unselected_flat_hidden_keeps_original_row_selection() -> None:
     assert selected.shape == (2, 2, 2)
     torch.testing.assert_close(selected[0, 0], hidden[0])
     torch.testing.assert_close(selected[1, 0], hidden[2])
+
+
+def test_dp_rank_oldlogprob_refs_use_batch_aligned_non_tensor_stack() -> None:
+    class FakeTensorDictUtils:
+        @staticmethod
+        def assign_non_tensor(output, **values):
+            output.update(values)
+
+        @staticmethod
+        def assign_non_tensor_data(*_args, **_kwargs):
+            raise AssertionError("batch-aligned refs must not use scalar NonTensorData")
+
+    rank_outputs = []
+    for rank in range(4):
+        output = {}
+        refs = [
+            f"rank-{rank}-sample-{index}" if rank < 2 else None
+            for index in range(64)
+        ]
+        metas = [{"chunk_start": index, "chunk_length": 1} for index in range(64)]
+        _assign_oldlogprob_worker_side_channel(
+            FakeTensorDictUtils, output, OLD_LOGPROB_HIDDEN_REFS_KEY, refs
+        )
+        _assign_oldlogprob_worker_side_channel(
+            FakeTensorDictUtils, output, OLD_LOGPROB_HIDDEN_REF_META_KEY, metas
+        )
+        rank_outputs.append(output)
+
+    merged_refs = [
+        ref for output in rank_outputs for ref in output[OLD_LOGPROB_HIDDEN_REFS_KEY]
+    ]
+    merged_metas = [
+        meta
+        for output in rank_outputs
+        for meta in output[OLD_LOGPROB_HIDDEN_REF_META_KEY]
+    ]
+
+    assert len(merged_refs) == 256
+    assert len(merged_metas) == 256
+    assert sum(ref is not None for ref in merged_refs) == 128
+    assert merged_refs[0] == "rank-0-sample-0"
+    assert merged_refs[127] == "rank-1-sample-63"
+    assert merged_refs[128:] == [None] * 128
+
+
+def test_batch_aligned_ref_meta_rebuilds_sample_chunk_slice() -> None:
+    ref = object()
+    chunks = oldlogprob_ref_chunks_from_meta(
+        ref,
+        {
+            "chunk_start": 17,
+            "chunk_length": 129,
+            "chunk_row_indices": [0, 2],
+            "dtype": "torch.bfloat16",
+            "shape": (512, 4096),
+        },
+    )
+
+    assert chunks == [
+        {
+            "ref": ref,
+            "chunk_start": 17,
+            "chunk_length": 129,
+            "chunk_row_indices": [0, 2],
+            "dtype": "torch.bfloat16",
+            "shape": (512, 4096),
+        }
+    ]
 
 
 def test_forward_hook_rejects_malformed_selected_hidden() -> None:

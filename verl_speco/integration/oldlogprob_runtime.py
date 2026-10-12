@@ -60,6 +60,54 @@ _PATCHED = False
 _BATCH_POSTPROCESS_PATCHED = False
 _POSTPROCESS_PATCHED = False
 
+_OLD_LOGPROB_SAMPLE_ALIGNED_KEYS = {
+    OLD_LOGPROB_HIDDEN_REFS_KEY,
+    OLD_LOGPROB_HIDDEN_REF_META_KEY,
+}
+
+
+def _assign_oldlogprob_worker_side_channel(
+    tu: Any, final_output: Any, key: str, value: Any
+) -> None:
+    """Preserve per-sample side-channel rows across the DP collect boundary.
+
+    ``assign_non_tensor_data`` stores a complete Python list as one scalar
+    ``NonTensorData`` value. The nD worker-group collector consequently keeps
+    only one FSDP rank's list. The refs and metadata are batch-aligned, so they
+    must be emitted as a ``NonTensorStack`` via ``assign_non_tensor``; TensorDict
+    concatenation then joins every DP rank in global batch order.
+    """
+    if key in _OLD_LOGPROB_SAMPLE_ALIGNED_KEYS and isinstance(value, (list, tuple)):
+        assign_non_tensor = getattr(tu, "assign_non_tensor", None)
+        if callable(assign_non_tensor):
+            assign_non_tensor(final_output, **{key: list(value)})
+            return
+    tu.assign_non_tensor_data(final_output, key, value)
+
+
+def oldlogprob_ref_chunks_from_meta(hidden_ref: Any, meta: Any) -> list[dict[str, Any]]:
+    """Rebuild one sample's chunk slice from its batch-aligned ref metadata."""
+    if hidden_ref is None or not isinstance(meta, dict):
+        return []
+    try:
+        length = int(meta.get("chunk_length", 0) or 0)
+        start = int(meta.get("chunk_start", 0) or 0)
+    except (TypeError, ValueError):
+        return []
+    if length <= 0:
+        return []
+    chunk = {
+        "ref": hidden_ref,
+        "chunk_start": start,
+        "chunk_length": length,
+        "dtype": meta.get("dtype"),
+        "shape": meta.get("shape"),
+    }
+    row_indices = meta.get("chunk_row_indices")
+    if row_indices is not None:
+        chunk["chunk_row_indices"] = row_indices
+    return [chunk]
+
 
 def _get_nested(config: Any, path: tuple[str, ...], default=None):
     current = config
@@ -589,9 +637,16 @@ def _install_oldlogprob_training_worker_postprocess_patch() -> bool:
             from verl.utils import tensordict_utils as tu
 
             for key, value in speco_non_tensor.items():
-                # These ObjectRef side-channel payloads use original sample indices and
-                # chunk-level metadata; they are not shaped like upstream tensor outputs.
-                tu.assign_non_tensor_data(final_output, key, value)
+                # Chunk-level arrays are not batch-aligned and therefore cannot
+                # survive DP TensorDict concatenation safely. Per-sample refs
+                # and metadata contain the same slice information and are
+                # reconstructed by the trainer after all ranks are collected.
+                if key in (
+                    OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
+                    OLD_LOGPROB_HIDDEN_CHUNK_META_KEY,
+                ):
+                    continue
+                _assign_oldlogprob_worker_side_channel(tu, final_output, key, value)
         return final_output
 
     worker_cls._postprocess_output = speco_postprocess_output

@@ -131,6 +131,66 @@ def test_drafter_training_attempt_requires_interval_and_samples() -> None:
     assert trainer._speco_should_attempt_drafter_train_this_step() is True
 
 
+def test_drafter_training_can_overlap_student_update() -> None:
+    trainer = _trainer(
+        {
+            "training_interval_steps": 1,
+            "overlap_with_student_update": True,
+        },
+        step=1,
+    )
+    trainer._speco_last_collected_samples = 1
+    trainer._speco_last_raw_drafter_samples = 1
+    trainer._speco_last_collect_interval_matched = 1
+    trainer._pending_drafter_publish_refs = None
+    trainer.checkpoint_manager = None
+    trainer.actor_rollout_wg = _FakeRolloutWorkerGroup()
+    trainer._speco_rollout_generation_target = lambda: trainer.actor_rollout_wg
+    trainer._compute_old_log_prob = lambda batch: batch
+    trainer._speco_wait_pending_drafter_publish = lambda: None
+    events = []
+
+    trainer._speco_set_drafter_global_step = lambda: events.append("set_step")
+    trainer._speco_sync_target_lm_head_weight = lambda: events.append("sync_head") or {}
+    trainer._speco_start_drafter_training = lambda: (
+        events.append("drafter_start") or {"refs": "pending"}
+    )
+    trainer._speco_finish_drafter_training = lambda pending: (
+        events.append(("drafter_finish", pending["refs"]))
+        or (True, {"drafter/trained": 1})
+    )
+    trainer._speco_publish_drafter_weights = lambda trained: (
+        events.append(("publish", trained)) or {"drafter/published": int(trained)}
+    )
+    trainer._speco_update_output_metrics = lambda output, metrics: (
+        output.meta_info["metrics"].update(metrics) or output
+    )
+
+    def update_student():
+        events.append("student_update")
+        assert "drafter_start" in events
+        assert not any(
+            isinstance(event, tuple) and event[0] == "drafter_finish"
+            for event in events
+        )
+        return SimpleNamespace(meta_info={"metrics": {}})
+
+    trainer._update_actor = update_student
+
+    with trainer._speco_online_fit_hooks():
+        output = trainer._update_actor()
+
+    assert events == [
+        "set_step",
+        "sync_head",
+        "drafter_start",
+        "student_update",
+        ("drafter_finish", "pending"),
+        ("publish", True),
+    ]
+    assert output.meta_info["metrics"]["drafter/train_overlap_with_student_update"] == 1
+
+
 def test_oldlogprob_entropy_wrapper_respects_no_drafter_entropy_config() -> None:
     assert (
         _no_drafter_trainer(

@@ -26,6 +26,7 @@ from omegaconf import OmegaConf, open_dict
 from verl.trainer.main_ppo import TaskRunner, create_rl_dataset, create_rl_sampler
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
+from verl_speco.integration.opd_cotrain import validate_sync_opd_cotrain_config
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +225,7 @@ class SpecoTaskRunner(TaskRunner):
         return _remotify_like_worker_mapping_value(worker_cls, wrapped_cls)
 
     def run(self, config):
+        validate_sync_opd_cotrain_config(config)
         # Ray actors do not share imported modules. Install this in the task
         # runner process before LLMServerManager imports verl's vLLM adapter.
         _install_vllm_import_compat_for_task_runner(config)

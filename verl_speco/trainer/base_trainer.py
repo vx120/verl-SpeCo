@@ -52,6 +52,7 @@ from verl.utils.ulysses import (
 )
 from verl_speco.trainer.checkpoint import release_checkpoint_host_memory
 from verl_speco.trainer.feature_store import DraftFeatureSample
+from verl_speco.trainer.sample_cycle import sample_cyclic_without_replacement
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -669,6 +670,12 @@ class DrafterBaseTrainer:
     def reset_training_metrics(self) -> None:
         self._training_metric_sums = {}
         self._training_metric_steps = 0
+        self._training_sample_draws = 0
+        self._training_unique_sample_ids: set[int] = set()
+        # reset_training_metrics() is called once at the start of each online
+        # training trigger. Keep an epoch-wide view so consecutive optimizer
+        # steps cover the eligible pool before reusing samples.
+        self._training_epoch_seen_sample_ids: set[int] = set()
 
     def get_training_metrics(self) -> dict[str, float]:
         sums = dict(self._training_metric_sums)
@@ -710,10 +717,18 @@ class DrafterBaseTrainer:
             f"{prefix}/masked_rows",
             f"{prefix}/sampled_vocab_size",
             f"{prefix}/loss_mode_id",
+            f"{prefix}/l1_chunk_size",
+            f"{prefix}/full_vocab_chunk_size",
+            f"{prefix}/checkpoint_loss_chunks",
+            f"{prefix}/gradient_checkpointing",
         ):
             if key in sums:
                 metrics[key] = sums[key] / steps
         metrics[f"{prefix}/metric_steps"] = float(self._training_metric_steps)
+        metrics["drafter/train_sample_draws"] = float(self._training_sample_draws)
+        metrics["drafter/train_unique_samples"] = float(
+            len(self._training_unique_sample_ids)
+        )
         metrics["drafter/optimizer_steps_total"] = float(self.optimizer_steps_total)
         if self.optimizer is not None and self.optimizer.param_groups:
             metrics["drafter/current_lr"] = float(self.optimizer.param_groups[0]["lr"])
@@ -742,6 +757,54 @@ class DrafterBaseTrainer:
             key, 0.0
         ) + float(elapsed_sec)
 
+    def reset_runtime_memory_stats(self) -> None:
+        """Reset process-local accelerator peaks before a Drafter train trigger."""
+        if device_name == "cpu":
+            return
+        reset_peak = getattr(self.device_module, "reset_peak_memory_stats", None)
+        if not callable(reset_peak):
+            return
+        try:
+            reset_peak(self.runtime_device)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            logger.debug("Unable to reset Drafter memory peak stats: %s", exc)
+
+    def get_runtime_memory_metrics(self, phase: str) -> dict[str, float]:
+        """Return process-local accelerator memory counters in GiB."""
+        if device_name == "cpu":
+            return {}
+
+        phase = str(phase).strip().replace(" ", "_")
+        prefix = f"drafter/memory_{phase}"
+        metric_methods = {
+            "allocated_gib": "memory_allocated",
+            "reserved_gib": "memory_reserved",
+            "peak_allocated_gib": "max_memory_allocated",
+            "peak_reserved_gib": "max_memory_reserved",
+        }
+        metrics: dict[str, float] = {}
+        gib = float(1024**3)
+        for suffix, method_name in metric_methods.items():
+            method = getattr(self.device_module, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                metrics[f"{prefix}_{suffix}"] = float(method(self.runtime_device)) / gib
+            except (RuntimeError, TypeError, ValueError) as exc:
+                logger.debug(
+                    "Unable to read Drafter memory metric %s: %s", method_name, exc
+                )
+
+        mem_get_info = getattr(self.device_module, "mem_get_info", None)
+        if callable(mem_get_info):
+            try:
+                free_bytes, total_bytes = mem_get_info(self.runtime_device)
+                metrics[f"{prefix}_free_gib"] = float(free_bytes) / gib
+                metrics[f"{prefix}_total_gib"] = float(total_bytes) / gib
+            except (RuntimeError, TypeError, ValueError) as exc:
+                logger.debug("Unable to read Drafter free memory: %s", exc)
+        return metrics
+
     def _reduce_training_metric(self, value: torch.Tensor) -> torch.Tensor:
         reduced = value.detach().float().clone()
         sp_group = self._get_sp_group()
@@ -759,12 +822,16 @@ class DrafterBaseTrainer:
             dist.all_reduce(reduced, group=self.training_device_mesh.get_group())
         return reduced
 
-    def _record_dflash_training_metrics(self, loss_dict: dict[str, Any]) -> None:
+    def _record_dflash_training_metrics(
+        self, loss_dict: dict[str, Any]
+    ) -> dict[str, Any]:
         diagnostics = loss_dict.get("diagnostics")
         if not isinstance(diagnostics, dict):
-            return
+            return {}
         self._training_metric_steps += 1
         prefix = self._block_drafter_metric_prefix()
+        step_scalars: dict[str, float] = {}
+        step_vectors: dict[str, list[float]] = {}
         scalar_keys = {
             "correct_count": f"{prefix}/correct_count",
             "eval_token_count": f"{prefix}/eval_token_count",
@@ -781,16 +848,32 @@ class DrafterBaseTrainer:
             "masked_rows": f"{prefix}/masked_rows",
             "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
             "loss_mode_id": f"{prefix}/loss_mode_id",
+            "l1_chunk_size": f"{prefix}/l1_chunk_size",
+            "full_vocab_chunk_size": f"{prefix}/full_vocab_chunk_size",
+            "checkpoint_loss_chunks": f"{prefix}/checkpoint_loss_chunks",
+            "gradient_checkpointing": f"{prefix}/gradient_checkpointing",
+        }
+        local_configuration_scalars = {
+            "l1_chunk_size",
+            "full_vocab_chunk_size",
+            "checkpoint_loss_chunks",
+            "gradient_checkpointing",
         }
         for source_key, metric_key in scalar_keys.items():
             value = diagnostics.get(source_key)
             if not torch.is_tensor(value):
                 continue
             value = cast(torch.Tensor, value)
-            reduced = self._reduce_training_metric(value.reshape(()))
-            self._training_metric_sums[metric_key] = self._training_metric_sums.get(
-                metric_key, 0.0
-            ) + float(reduced.cpu().item())
+            reduced = (
+                value.detach().float().reshape(())
+                if source_key in local_configuration_scalars
+                else self._reduce_training_metric(value.reshape(()))
+            )
+            step_scalars[source_key] = float(reduced.cpu().item())
+            self._training_metric_sums[metric_key] = (
+                self._training_metric_sums.get(metric_key, 0.0)
+                + step_scalars[source_key]
+            )
 
         vector_keys = {
             "loss_sum_per_position": f"{prefix}/loss_sum_per_position",
@@ -803,11 +886,43 @@ class DrafterBaseTrainer:
                 continue
             value = cast(torch.Tensor, value)
             reduced = self._reduce_training_metric(value)
-            for idx, item in enumerate(reduced.detach().cpu().tolist()):
+            reduced_items = [
+                float(item) for item in reduced.detach().cpu().reshape(-1).tolist()
+            ]
+            step_vectors[source_key] = reduced_items
+            for idx, item in enumerate(reduced_items):
                 metric_key = f"{metric_prefix}/{idx}"
-                self._training_metric_sums[metric_key] = self._training_metric_sums.get(
-                    metric_key, 0.0
-                ) + float(item)
+                self._training_metric_sums[metric_key] = (
+                    self._training_metric_sums.get(metric_key, 0.0) + item
+                )
+
+        quality_tokens = step_scalars.get("quality_token_count", 0.0)
+        eval_tokens = step_scalars.get("eval_token_count", 0.0)
+        correct_per_position = step_vectors.get("correct_per_position", [])
+        count_per_position = step_vectors.get("count_per_position", [])
+        return {
+            "accuracy": (
+                step_scalars.get("correct_count", 0.0) / eval_tokens
+                if eval_tokens > 0
+                else float("nan")
+            ),
+            "top1_acc": (
+                step_scalars.get("top1_correct_count", 0.0) / quality_tokens
+                if quality_tokens > 0
+                else float("nan")
+            ),
+            "top5_acc": (
+                step_scalars.get("top5_correct_count", 0.0) / quality_tokens
+                if quality_tokens > 0
+                else float("nan")
+            ),
+            "acc_per_position": [
+                correct / count if count > 0 else float("nan")
+                for correct, count in zip(
+                    correct_per_position, count_per_position, strict=False
+                )
+            ],
+        }
 
     def _get_sp_group(self):
         if self._has_mesh_dim("sp"):
@@ -3250,7 +3365,7 @@ class DrafterBaseTrainer:
 
         return None
 
-    def _sample_training_items(
+    def _sample_training_items_once(
         self,
         available_data: list[dict[str, Any]],
         batch_size: int,
@@ -3286,6 +3401,32 @@ class DrafterBaseTrainer:
             selected.extend(rng.sample(remaining, min(random_count, len(remaining))))
 
         return selected
+
+    def _sample_training_items(
+        self,
+        available_data: list[dict[str, Any]],
+        batch_size: int,
+        rng: random.Random,
+    ) -> list[dict[str, Any]]:
+        """Sample a batch, optionally cycling through the pool before reuse."""
+        cycle_without_replacement = bool(
+            self.config.rollout.drafter.training.get(
+                "cycle_samples_without_replacement", False
+            )
+        )
+        if not cycle_without_replacement or len(available_data) <= batch_size:
+            return self._sample_training_items_once(available_data, batch_size, rng)
+
+        seen_ids = getattr(self, "_training_epoch_seen_sample_ids", set())
+        self._training_epoch_seen_sample_ids = seen_ids
+        return sample_cyclic_without_replacement(
+            available_data,
+            batch_size,
+            seen_ids,
+            lambda remaining, take: self._sample_training_items_once(
+                remaining, take, rng
+            ),
+        )
 
     def _prepare_training_batch(
         self,
@@ -3387,6 +3528,7 @@ class DrafterBaseTrainer:
         )
         items_seen = len(items)
         items_used = 0
+        used_sample_ids: list[int] = []
         items_dropped_short = 0
         items_dropped_missing_target = 0
         packed_tokens_before_shift = 0
@@ -3497,6 +3639,7 @@ class DrafterBaseTrainer:
                 continue
 
             items_used += 1
+            used_sample_ids.append(id(source_item))
             packed_tokens_before_shift += train_seq_len
             if self._is_block_drafter_backend():
                 packed_loss_tokens += int(
@@ -4041,6 +4184,8 @@ class DrafterBaseTrainer:
         elif self.backend.model_type == "dspark" and target_last_hidden_state_chunks:
             batch["target_last_hidden_states"] = target_last_hidden_states
         batch["_speco_pad_size"] = pad_size_for_batch
+        batch["_speco_sample_count"] = items_used
+        batch["_speco_sample_ids"] = tuple(used_sample_ids)
 
         if alignment_debug_enabled():
             final_target = None
@@ -4172,6 +4317,38 @@ class DrafterBaseTrainer:
     def prepare_training_batch(self) -> Optional[dict[str, torch.Tensor]]:
         with self._ulysses_group_context():
             return self._prepare_training_batch()
+
+    def get_training_data_stats(self) -> dict[str, Any]:
+        """Describe the sample pool used by the next online training trigger."""
+        sample_last_n_steps = int(
+            self.config.rollout.drafter.training.get("sample_last_n_steps", 2)
+        )
+        if self.use_data_buffer:
+            all_items = self.data_buffer.get_all_data()
+            eligible_items = self.data_buffer.get_data_from_last_n_steps(
+                sample_last_n_steps
+            )
+        else:
+            all_items = list(self.collected_data)
+            eligible_items = [
+                item
+                for item in all_items
+                if int(item.get("step", self.current_rl_step))
+                == int(self.current_rl_step)
+            ]
+
+        step_counts: dict[int, int] = {}
+        for item in eligible_items:
+            source_step = int(item.get("step", self.current_rl_step))
+            step_counts[source_step] = step_counts.get(source_step, 0) + 1
+
+        return {
+            "buffer_total": len(all_items),
+            "eligible_samples": len(eligible_items),
+            "eligible_step_counts": step_counts,
+            "sample_last_n_steps": sample_last_n_steps,
+            "batch_size": int(self.batch_size),
+        }
 
     def add_feature_sample(self, sample: DraftFeatureSample | dict[str, Any]) -> None:
         """Append a normalized standalone sample to the in-memory training buffer."""
@@ -4334,6 +4511,7 @@ class DrafterBaseTrainer:
     ) -> bool:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
+        sample_count = int(batch.get("_speco_sample_count", 0) or 0)
 
         # Forward pass.
         forward_ts = time.time()
@@ -4352,7 +4530,7 @@ class DrafterBaseTrainer:
                 l_v = loss_dict["total_local_vloss"]
                 l_p = loss_dict["total_local_ploss"]
                 l_n = loss_dict["local_num_tokens"]
-                self._record_dflash_training_metrics(loss_dict)
+                step_accuracy = self._record_dflash_training_metrics(loss_dict)
         self.record_training_timing(
             "timing_s/drafter_forward_loss", time.time() - forward_ts
         )
@@ -4426,14 +4604,28 @@ class DrafterBaseTrainer:
         )
 
         self.training_steps += 1
+        self._training_sample_draws += sample_count
+        self._training_unique_sample_ids.update(batch.get("_speco_sample_ids", ()))
+        acc_per_position = ",".join(
+            f"{idx}:{value:.4f}"
+            for idx, value in enumerate(step_accuracy.get("acc_per_position", []))
+        )
         logger.warning(
-            "[drafter loss] step=%s optimizer_step_total=%s lr=%.3e loss=%.4f vloss=%.4f ploss=%.4f",
+            "[drafter loss] rl_step=%s drafter_step=%s optimizer_step_total=%s "
+            "samples=%s loss_tokens=%s lr=%.3e loss=%.4f vloss=%.4f ploss=%.4f "
+            "top1_acc=%.4f top5_acc=%.4f acc_pos=[%s]",
+            step,
             self.training_steps,
             self.optimizer_steps_total,
+            sample_count,
+            int(global_tokens.detach().item()),
             current_lr,
             float(loss.item()),
             float(vloss.item()),
             float(ploss.item()),
+            float(step_accuracy.get("top1_acc", float("nan"))),
+            float(step_accuracy.get("top5_acc", float("nan"))),
+            acc_per_position,
         )
         return True
 

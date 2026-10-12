@@ -45,6 +45,7 @@ from verl.utils.distributed import (
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
+from verl_speco.integration.opd_cotrain import ensure_student_only_feature_payload
 from verl_speco.trainer.feature_store import DraftFeatureSample, TorchShardFeatureStore
 
 logger = logging.getLogger(__file__)
@@ -764,6 +765,7 @@ class SpecoWorker(Worker):
         for sample in samples:
             if not sample:
                 continue
+            ensure_student_only_feature_payload(sample)
             batch = {
                 "input_ids": sample["input_ids"],
                 "prompts": sample["prompts"],
@@ -994,9 +996,11 @@ class SpecoWorker(Worker):
             result["triggered"] = True
             start_ts = time.time()
             self.trainer.clear_pending_publish_state_dict()
+            self.trainer.reset_runtime_memory_stats()
             activation_ts = time.time()
             success = await self.trainer.activate_training_model()
             result["activation_elapsed_sec"] = time.time() - activation_ts
+            result.update(self.trainer.get_runtime_memory_metrics("after_activation"))
             if not success:
                 logger.error(
                     "[SpecoWorker replica=%s] failed to activate trainer at step %s",
@@ -1014,13 +1018,45 @@ class SpecoWorker(Worker):
             try:
                 train_loop_ts = time.time()
                 self.trainer.reset_training_metrics()
+                data_stats = self.trainer.get_training_data_stats()
+                result.update(
+                    {
+                        "train_buffer_total": int(data_stats["buffer_total"]),
+                        "train_eligible_samples": int(data_stats["eligible_samples"]),
+                    }
+                )
+                if self.is_drafter_group_leader:
+                    logger.warning(
+                        "[drafter data] rl_step=%s replica=%s buffer_total=%s "
+                        "eligible_samples=%s eligible_step_counts=%s "
+                        "sample_last_n_steps=%s batch_size=%s train_steps=%s",
+                        self.last_global_step,
+                        self.replica_rank,
+                        data_stats["buffer_total"],
+                        data_stats["eligible_samples"],
+                        data_stats["eligible_step_counts"],
+                        data_stats["sample_last_n_steps"],
+                        data_stats["batch_size"],
+                        self.train_steps_per_trigger,
+                    )
                 for _ in range(self.train_steps_per_trigger):
                     result["attempted_steps"] += 1
                     step_ok = await self.trainer.training_step(self.last_global_step)
                     if step_ok:
                         result["successful_steps"] += 1
                 result["training_loop_elapsed_sec"] = time.time() - train_loop_ts
+                result.update(self.trainer.get_runtime_memory_metrics("after_training"))
                 result.update(self.trainer.get_training_metrics())
+                if self.is_drafter_group_leader:
+                    logger.warning(
+                        "[drafter data used] rl_step=%s replica=%s "
+                        "successful_steps=%s sample_draws=%s unique_samples=%s",
+                        self.last_global_step,
+                        self.replica_rank,
+                        result["successful_steps"],
+                        int(result.get("drafter/train_sample_draws", 0)),
+                        int(result.get("drafter/train_unique_samples", 0)),
+                    )
                 if result["successful_steps"] > 0:
                     should_prepare_publish = (
                         self.publish_interval_steps <= 0
@@ -1046,11 +1082,13 @@ class SpecoWorker(Worker):
                     self.trainer.clear_pending_publish_state_dict()
                 result.update(self.trainer.get_training_metrics())
             finally:
+                result.update(self.trainer.get_runtime_memory_metrics("before_cleanup"))
                 cleanup_ts = time.time()
                 await self.trainer.cleanup_training(
                     clear_data=result["successful_steps"] > 0
                 )
                 result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
+                result.update(self.trainer.get_runtime_memory_metrics("after_cleanup"))
 
             result["trained"] = result["successful_steps"] > 0
             result["reason"] = "trained" if result["trained"] else "no_trainable_batch"

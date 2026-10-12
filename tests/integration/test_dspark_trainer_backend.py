@@ -92,8 +92,11 @@ def test_dspark_checkpoint_preserves_source_config_and_vllm_weight_names(
 def _small_dspark_training_model(
     block_size: int = 4,
     l1_loss_alpha: float = 0.0,
-    l1_chunk_size: int = 0,
+    l1_chunk_size: int = 128,
     loss_mode: str = "full_vocab",
+    full_vocab_chunk_size: int = 128,
+    checkpoint_loss_chunks: bool = True,
+    gradient_checkpointing: bool = True,
 ):
     config = DSparkConfig(
         hidden_size=8,
@@ -121,6 +124,9 @@ def _small_dspark_training_model(
         loss_mode=loss_mode,
         l1_loss_alpha=l1_loss_alpha,
         l1_chunk_size=l1_chunk_size,
+        full_vocab_chunk_size=full_vocab_chunk_size,
+        checkpoint_loss_chunks=checkpoint_loss_chunks,
+        gradient_checkpointing=gradient_checkpointing,
     )
 
 
@@ -145,7 +151,10 @@ def test_dspark_default_loss_weights_match_deepspec():
     assert config.l1_loss_alpha == pytest.approx(0.9)
     assert model.ce_loss_alpha == pytest.approx(0.1)
     assert model.l1_loss_alpha == pytest.approx(0.9)
-    assert model.l1_chunk_size == 0
+    assert model.l1_chunk_size == 128
+    assert model.full_vocab_chunk_size == 128
+    assert model.checkpoint_loss_chunks is True
+    assert model.draft_model.gradient_checkpointing is True
 
 
 def test_dspark_untrained_confidence_head_is_kept_but_excluded_from_optimizer():
@@ -356,13 +365,8 @@ def test_dspark_l1_loss_uses_target_last_hidden_states():
     assert diagnostics["l1_loss_sum"].item() >= 0
 
 
-@pytest.mark.parametrize(
-    ("loss_mode", "expects_reused_log_probs"),
-    [("full_vocab", True), ("restricted_ce", False)],
-)
-def test_dspark_l1_reuses_only_full_vocab_ce_log_probs(
-    monkeypatch, loss_mode, expects_reused_log_probs
-):
+@pytest.mark.parametrize("loss_mode", ["full_vocab", "restricted_ce"])
+def test_dspark_l1_recomputes_chunk_probabilities(monkeypatch, loss_mode):
     model = _small_dspark_training_model(
         block_size=2,
         l1_loss_alpha=0.5,
@@ -393,14 +397,75 @@ def test_dspark_l1_reuses_only_full_vocab_ce_log_probs(
 
     assert torch.isfinite(loss)
     assert len(captured_log_probs) == 1
-    assert (captured_log_probs[0] is not None) is expects_reused_log_probs
-    if captured_log_probs[0] is not None:
-        probability_mass = captured_log_probs[0].exp().sum(dim=-1)
-        assert torch.allclose(
-            probability_mass, torch.ones_like(probability_mass), atol=1e-5, rtol=1e-5
-        )
+    assert captured_log_probs[0] is None
     assert any(
         parameter.grad is not None and torch.isfinite(parameter.grad).all()
         for parameter in model.parameters()
         if parameter.requires_grad
     )
+
+
+def test_dspark_checkpointed_full_vocab_ce_matches_legacy_math():
+    reference = _small_dspark_training_model(
+        block_size=2,
+        full_vocab_chunk_size=0,
+        checkpoint_loss_chunks=False,
+    )
+    chunked = _small_dspark_training_model(
+        block_size=2,
+        full_vocab_chunk_size=2,
+        checkpoint_loss_chunks=True,
+    )
+    chunked.load_state_dict(reference.state_dict())
+
+    active_hidden_ref = torch.randn(5, 8, requires_grad=True)
+    active_hidden_chunked = active_hidden_ref.detach().clone().requires_grad_(True)
+    prev_tokens = torch.tensor([1, 2, 3, 4, 5], dtype=torch.long)
+    targets = torch.tensor([2, 3, 4, 5, 6], dtype=torch.long)
+    weights = torch.tensor([1.0, 0.5, 0.25, 1.0, 0.75])
+    lm_head_weight = torch.randn(32, 8)
+
+    reference_result = reference._compute_full_vocab_ce_for_active(
+        active_hidden=active_hidden_ref,
+        active_prev_tokens=prev_tokens,
+        active_targets=targets,
+        active_weights=weights,
+        lm_head_weight=lm_head_weight,
+    )
+    chunked_result = chunked._compute_full_vocab_ce_for_active(
+        active_hidden=active_hidden_chunked,
+        active_prev_tokens=prev_tokens,
+        active_targets=targets,
+        active_weights=weights,
+        lm_head_weight=lm_head_weight,
+    )
+
+    for reference_value, chunked_value in zip(reference_result, chunked_result):
+        if reference_value.is_floating_point():
+            assert torch.allclose(reference_value, chunked_value, atol=1e-6, rtol=1e-6)
+        else:
+            assert torch.equal(reference_value, chunked_value)
+
+    reference_result[0].backward()
+    chunked_result[0].backward()
+    assert torch.allclose(
+        active_hidden_ref.grad,
+        active_hidden_chunked.grad,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    for (reference_name, reference_parameter), (
+        chunked_name,
+        chunked_parameter,
+    ) in zip(reference.named_parameters(), chunked.named_parameters()):
+        assert reference_name == chunked_name
+        if reference_parameter.grad is None or chunked_parameter.grad is None:
+            assert reference_parameter.grad is None
+            assert chunked_parameter.grad is None
+            continue
+        assert torch.allclose(
+            reference_parameter.grad,
+            chunked_parameter.grad,
+            atol=1e-6,
+            rtol=1e-6,
+        )

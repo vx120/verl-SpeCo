@@ -68,7 +68,14 @@ actor_rollout_ref:
         max_seq_len: 8192
         step: 10
         batch_size_per_gpu: 4
+        # Cover the eligible sample pool once before reusing samples across
+        # optimizer steps in the same online-training trigger.
+        cycle_samples_without_replacement: false
         training_interval_steps: 5
+        # Submit Drafter training before the Student update and wait only for
+        # its remaining tail afterwards. Opt in because colocated models may
+        # otherwise trade the saved bubble for GPU contention or OOM.
+        overlap_with_student_update: false
         publish_interval_steps: 0
         publish_async: false
         publish_dtype: null
@@ -131,7 +138,13 @@ actor_rollout_ref:
         dspark_confidence_head_with_markov: true
         dspark_ce_loss_alpha: 0.1
         dspark_l1_loss_alpha: 0.45
-        dspark_l1_chunk_size: 0
+        # Bound exact full-vocabulary CE/L1 intermediates by active-token rows.
+        # Checkpointed chunks are recomputed during backward instead of keeping
+        # every vocab-sized probability tensor alive across the whole forward.
+        dspark_l1_chunk_size: 128
+        dspark_full_vocab_chunk_size: 128
+        dspark_checkpoint_loss_chunks: true
+        dspark_gradient_checkpointing: true
         dspark_debug_log: false
         dspark_debug_log_first_n: 2
         dspark_debug_log_interval: 100
