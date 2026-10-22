@@ -15,6 +15,9 @@
 
 from __future__ import annotations
 
+import functools
+import importlib
+import inspect
 import logging
 import os
 import time
@@ -536,6 +539,158 @@ def _export_actor_lm_head_rows_direct(worker: Any, row_indices: Any) -> Optional
     return None
 
 
+_FSDP_ENGINE_MODULE = "verl.workers.engine.fsdp.transformer_impl"
+
+
+def _is_lm_head_param_name(name: str) -> bool:
+    return name == "lm_head.weight" or name.endswith(".lm_head.weight")
+
+
+def _is_embed_param_name(name: str) -> bool:
+    return name == "model.embed_tokens.weight" or name.endswith(".embed_tokens.weight")
+
+
+def _capture_lm_head_from_param_stream(engine: Any, params: Any):
+    """Tee lm_head (or tied embedding) rows out of the weight-sync generator.
+
+    The Student rollout weight sync already gathers every full tensor, so
+    copying this one tensor to host is nearly free compared with a separate
+    ``get_per_tensor_param()`` pass before the actor update.
+    """
+    torch = _torch_module()
+    dist = torch.distributed
+    is_owner = not dist.is_initialized() or dist.get_rank() == 0
+    selected: tuple[str, Any, int] | None = None
+    fallback: tuple[str, Any, int] | None = None
+    for name, tensor in params:
+        if torch.is_tensor(tensor) and tensor.dim() == 2:
+            name_str = str(name)
+            is_lm_head = _is_lm_head_param_name(name_str)
+            if is_lm_head or _is_embed_param_name(name_str):
+                host = (
+                    tensor.detach().to(device="cpu", dtype=torch.bfloat16, copy=True)
+                    if is_owner
+                    else None
+                )
+                entry = (name_str, host, int(tensor.shape[0]))
+                if is_lm_head:
+                    selected = entry
+                else:
+                    fallback = entry
+        yield name, tensor
+    chosen = selected or fallback
+    engine._speco_lm_head_cache = (
+        {
+            "name": chosen[0],
+            "weight": chosen[1],
+            "source_vocab_size": chosen[2],
+        }
+        if chosen is not None
+        else None
+    )
+
+
+def install_fsdp_engine_lm_head_capture() -> bool:
+    """Patch ``FSDPEngine.get_per_tensor_param`` to cache the target lm_head."""
+
+    try:
+        engine_cls = importlib.import_module(_FSDP_ENGINE_MODULE).FSDPEngine
+    except Exception:  # noqa: BLE001
+        return False
+    original = getattr(engine_cls, "get_per_tensor_param", None)
+    if original is None:
+        return False
+    if getattr(original, "_speco_lm_head_capture", False):
+        return True
+
+    @functools.wraps(original)
+    def get_per_tensor_param_with_lm_head_capture(self, *args, **kwargs):
+        self._speco_lm_head_cache = None
+        result = original(self, *args, **kwargs)
+        if not getattr(self, "_speco_capture_lm_head", False):
+            return result
+        params, peft_config = result
+        if (
+            peft_config is not None
+            or getattr(self, "_qat_enabled", False)
+            or not inspect.isgenerator(params)
+        ):
+            return result
+        return _capture_lm_head_from_param_stream(self, params), peft_config
+
+    setattr(get_per_tensor_param_with_lm_head_capture, "_speco_lm_head_capture", True)
+    engine_cls.get_per_tensor_param = get_per_tensor_param_with_lm_head_capture
+    return True
+
+
+def _lm_head_reuse_enabled(config: Any) -> bool:
+    if not drafter_rollout_enabled(config):
+        return False
+    path = ("drafter", "training", "reuse_weight_sync_lm_head")
+    for prefix in (("rollout",), ("actor_rollout_ref", "rollout")):
+        configured = _get_nested(config, prefix + path, None)
+        if configured is not None:
+            return bool(configured)
+    try:
+        from verl_speco.integration.sglang_runtime import _load_env_drafter_config
+
+        configured = _get_nested(
+            _load_env_drafter_config(), ("training", "reuse_weight_sync_lm_head"), None
+        )
+    except Exception:  # noqa: BLE001
+        configured = None
+    return True if configured is None else bool(configured)
+
+
+def _export_cached_actor_lm_head_weight(
+    worker: Any, row_indices: Any
+) -> tuple[bool, Optional[dict]]:
+    """Serve the lm_head captured during the last rollout weight sync.
+
+    Returns ``(hit, payload)``. Every rank must agree on ``hit`` because the
+    fallback path runs collectives; the cache is populated identically on all
+    ranks by the weight-sync generator.
+    """
+    engine = getattr(getattr(worker, "actor", None), "engine", None)
+    cache = getattr(engine, "_speco_lm_head_cache", None)
+    if cache is None:
+        logger.warning(
+            "[actor lm_head export] cache miss rank=%s capture_enabled=%s engine=%s",
+            getattr(worker, "rank", None),
+            getattr(engine, "_speco_capture_lm_head", None),
+            type(engine).__name__,
+        )
+        return False, None
+    if getattr(worker, "rank", None) != 0:
+        return True, None
+    torch = _torch_module()
+    weight = cache["weight"]
+    source_vocab_size = int(cache["source_vocab_size"])
+    rows = _normalize_lm_head_row_indices(row_indices)
+    exported_rows = None
+    selected_rows = None
+    if rows is not None and 0 < int(rows.numel()) < source_vocab_size:
+        rows = rows.to(device="cpu", dtype=torch.long).contiguous()
+        weight = weight.index_select(0, rows)
+        exported_rows = rows
+        selected_rows = int(rows.numel())
+    logger.warning(
+        "[actor lm_head export] cached_sync name=%s shape=%s source_vocab=%s selected_rows=%s",
+        cache["name"],
+        tuple(weight.shape),
+        source_vocab_size,
+        selected_rows,
+    )
+    return True, {
+        "name": cache["name"],
+        "weight": weight,
+        "row_indices": exported_rows,
+        "source_vocab_size": source_vocab_size,
+        "selected_rows": selected_rows,
+        "export_strategy": "cached_sync",
+    }
+
+
 def _is_veomni_actor_worker(worker: Any) -> bool:
     return actor_training_backend_name(getattr(worker, "config", None)) == "veomni"
 
@@ -772,6 +927,7 @@ def export_actor_lm_head_weight(
     worker: Any,
     row_indices: Any = None,
     keep_model_on_device: bool = False,
+    use_cached: bool = False,
 ) -> Optional[dict]:
     """Export actor lm_head or tied embedding rows from an actor-rollout worker."""
 
@@ -789,6 +945,11 @@ def export_actor_lm_head_weight(
             row_indices=row_indices,
             keep_model_on_device=keep_model_on_device,
         )
+
+    if use_cached:
+        hit, cached_payload = _export_cached_actor_lm_head_weight(worker, row_indices)
+        if hit:
+            return cached_payload
 
     normalized_row_indices = _normalize_lm_head_row_indices(row_indices)
     # Block drafters that train against the target's own lm_head rows.
@@ -893,7 +1054,19 @@ class DraftWeightPublishMixin:
     def init_model(self, *args, **kwargs):
         install_rollout_runtime_for_worker(self)
         install_oldlogprob_hidden_runtime_for_worker(self)
+        reuse_lm_head = _lm_head_reuse_enabled(getattr(self, "config", None))
+        patched = install_fsdp_engine_lm_head_capture() if reuse_lm_head else False
         result = super().init_model(*args, **kwargs)
+        engine = getattr(getattr(self, "actor", None), "engine", None)
+        if reuse_lm_head and engine is not None:
+            engine._speco_capture_lm_head = True
+        logger.warning(
+            "[actor lm_head capture] rank=%s enabled=%s patched=%s engine=%s",
+            getattr(self, "rank", None),
+            reuse_lm_head,
+            patched,
+            type(engine).__name__,
+        )
         validate_oldlogprob_hidden_runtime_for_worker(self)
         return result
 
@@ -902,11 +1075,13 @@ class DraftWeightPublishMixin:
         self,
         row_indices: Any = None,
         keep_model_on_device: bool = False,
+        use_cached: bool = False,
     ):
         return export_actor_lm_head_weight(
             self,
             row_indices=row_indices,
             keep_model_on_device=keep_model_on_device,
+            use_cached=use_cached,
         )
 
     @staticmethod

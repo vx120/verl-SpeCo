@@ -414,6 +414,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._pending_drafter_publish_refs = None
         self._pending_drafter_checkpoint_refs = []
         self._pending_target_lm_head_sync = None
+        self._speco_lm_head_cache_valid = False
         self._speco_last_raw_drafter_samples = 0
         self._speco_last_collected_samples = 0
         self._speco_last_oldlogprob_candidate_samples = 0
@@ -1970,12 +1971,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             and str(self.device_name).lower() == "npu"
             and actor_veomni_param_offload
         )
+        use_cached_lm_head = bool(
+            getattr(self, "_speco_lm_head_cache_valid", False)
+            and training_cfg.get("reuse_weight_sync_lm_head", True)
+        )
         fetch_started = time.perf_counter()
         payloads = (
             self._ray_get_if_needed(
                 get_actor_lm_head_weight(
                     row_indices,
                     keep_model_on_device=keep_actor_model_on_device,
+                    use_cached=use_cached_lm_head,
                 )
             )
             or []
@@ -2022,6 +2028,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "drafter/target_lm_head_direct_sparse_export": int(
                 export_strategy in {"direct_sparse", "veomni_lm_head_sparse"}
             ),
+            "drafter/target_lm_head_cache_requested": int(use_cached_lm_head),
+            "drafter/target_lm_head_cache_hit": int(export_strategy == "cached_sync"),
             "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
             "timing_s/drafter_sync_target_lm_head_dispatch": dispatch_elapsed,
         }
@@ -2686,6 +2694,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
             actor_started = time.perf_counter()
             try:
+                self._speco_lm_head_cache_valid = False
                 actor_output = original_update_actor(*args, **kwargs)
             except BaseException:
                 if pending_drafter_training is not None:
@@ -2756,6 +2765,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         def update_weights_with_speco(manager_self, *args, **kwargs):
             result = original_checkpoint_update_weights(*args, **kwargs)
+            self._speco_lm_head_cache_valid = True
             sync_drafter_lifecycle.after_student_rollout_weight_sync()
             return result
 

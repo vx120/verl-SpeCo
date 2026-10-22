@@ -186,6 +186,9 @@ actor_rollout_ref:
         # its remaining tail afterwards. Opt in because colocated models may
         # otherwise trade the saved bubble for GPU contention or OOM.
         overlap_with_student_update: false
+        # Reuse the target lm_head captured during the Student rollout weight
+        # sync instead of gathering it again before the actor update.
+        reuse_weight_sync_lm_head: true
         publish_interval_steps: 0
         publish_async: false
         publish_dtype: null
