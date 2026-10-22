@@ -78,6 +78,35 @@ def _unavailable_fused_moe(*args, **kwargs):
     )
 
 
+class _UnavailableFusedMoE:
+    """Legacy type marker for verl's non-FP8 vLLM import path."""
+
+
+def install_verl_vllm_fp8_import_compat(
+    module_importer: Callable[[str], Any] = importlib.import_module,
+) -> bool:
+    """Provide the removed legacy FusedMoE type expected by verl.
+
+    Current modular vLLM builds no longer expose ``FusedMoE`` from
+    ``fused_moe.layer``. verl imports that type eagerly even for dense,
+    non-FP8 models, so provide a marker that cannot match a real module.
+    """
+
+    try:
+        fused_moe_layer = module_importer(_VLLM_FUSED_MOE_LAYER_MODULE)
+    except ModuleNotFoundError as exc:
+        if exc.name != "vllm":
+            raise
+        return False
+    if hasattr(fused_moe_layer, "FusedMoE"):
+        return False
+    fused_moe_layer.FusedMoE = _UnavailableFusedMoE
+    logger.warning(
+        "Installed legacy FusedMoE import compatibility for non-FP8 vLLM models"
+    )
+    return True
+
+
 def _unused_factory_weight_loader(*args, **kwargs):
     del args, kwargs
     raise RuntimeError(
@@ -467,6 +496,7 @@ class VerlNPUVLLMImportCompatMixin:
         from verl_speco.integration.compat import check_compatible_verl
 
         check_compatible_verl()
+        install_verl_vllm_fp8_import_compat()
         install_verl_npu_vllm_import_compat()
         install_verl_fsdp_training_output_release_compat()
         install_verl_npu_checkpoint_reclaim()

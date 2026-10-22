@@ -49,6 +49,28 @@ _SPECO_WORKER_WRAPPER_METHOD_NAMES = {
 }
 
 
+async def _sync_vllm_capture_step(manager: Any, prompts: Any) -> None:
+    """Send the collection step separately from the published actor version."""
+    config: Any = getattr(manager, "config", None)
+    actor = config.get("actor_rollout_ref", {}) if hasattr(config, "get") else {}
+    rollout = actor.get("rollout", {})
+    training = rollout.get("drafter", {}).get("training", {})
+    if rollout.get("name") != "vllm" or not training.get(
+        "collect_hidden_states_from_vllm", False
+    ):
+        return
+    meta = getattr(prompts, "meta_info", {})
+    step = 0 if meta.get("validate", False) else int(meta["global_steps"])
+    handles = getattr(manager, "server_handles", None)
+    if not handles:
+        raise RuntimeError("vLLM capture requires rollout server handles")
+    import asyncio
+
+    await asyncio.gather(
+        *(handle.set_speco_capture_step.remote(step) for handle in handles)
+    )
+
+
 def _is_sglang_rollout_config(config: Any) -> bool:
     rollout_config = getattr(config, "actor_rollout_ref", None)
     rollout_config = getattr(rollout_config, "rollout", None)
@@ -536,6 +558,7 @@ def install_agent_loop_runtime_patch() -> bool:
 
         @wraps(manager_generate_sequences)
         async def speco_manager_generate_sequences(self, prompts):
+            await _sync_vllm_capture_step(self, prompts)
             if _is_sglang_rollout_config(getattr(self, "config", None)):
                 meta_info = getattr(prompts, "meta_info", None)
                 if isinstance(meta_info, dict) and "global_steps" in meta_info:

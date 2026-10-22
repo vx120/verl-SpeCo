@@ -200,6 +200,9 @@ class FileHiddenStatesStore(HiddenStatesStore):
             raise RuntimeError("vLLM hidden-state replay requires safetensors") from exc
         path = Path(reference)
         _wait_for_lock(Path(f"{path}.lock"))
+        error_path = Path(f"{path}.error")
+        if error_path.exists():
+            raise RuntimeError(f"vLLM feature export failed: {error_path.read_text()}")
         if not path.is_file():
             raise FileNotFoundError(f"vLLM hidden-states file not found: {path}")
         payload = dict(load_file(str(path), device="cpu"))
@@ -209,6 +212,7 @@ class FileHiddenStatesStore(HiddenStatesStore):
         path = Path(reference)
         path.unlink(missing_ok=True)
         Path(f"{path}.lock").unlink(missing_ok=True)
+        Path(f"{path}.error").unlink(missing_ok=True)
 
 
 class MooncakeHiddenStatesStore(HiddenStatesStore):

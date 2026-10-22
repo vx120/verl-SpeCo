@@ -406,6 +406,10 @@ def feature_from_vllm_payload(
     values = getattr(payload, "payload", payload)
     if not isinstance(values, Mapping):
         raise TypeError("vLLM hidden-states payload must be a mapping")
+    if "hidden_positions" in values:
+        from verl_speco.producer.windowed_features import windowed_feature
+
+        return windowed_feature(values, request, feature_config, final_norm=final_norm)
     token_ids = values.get("token_ids")
     hidden = values.get("hidden_states")
     if token_ids is None or hidden is None:
