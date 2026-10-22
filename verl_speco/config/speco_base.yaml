@@ -159,6 +159,11 @@ actor_rollout_ref:
       training:
         mode: online
         collect_hidden_states_from_sgl: false
+        collect_hidden_states_from_vllm: false
+        vllm_hidden_state_window:
+          mode: front
+          coordinate: response
+          min_rows: 1
         collect_hidden_states_from_old_logprob: false
         # SGLang does not apply the target final norm to captured aux states.
         # Keep this false unless training and serving consistently use pre-norm.

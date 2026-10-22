@@ -113,6 +113,7 @@ class DrafterCollectionSource(str, Enum):
     """Target-model feature source used by drafter collection."""
 
     SGLANG = "sglang"
+    VLLM = "vllm"
     OLD_LOGPROB = "oldlogprob"
     TRANSFER_QUEUE = "transfer_queue"
 
@@ -223,6 +224,7 @@ class CollectionPlan:
     def metrics(self) -> dict[str, float | int]:
         source_code = {
             DrafterCollectionSource.SGLANG: 1,
+            DrafterCollectionSource.VLLM: 4,
             DrafterCollectionSource.OLD_LOGPROB: 2,
             DrafterCollectionSource.TRANSFER_QUEUE: 3,
         }[self.source]

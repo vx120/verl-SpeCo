@@ -574,6 +574,9 @@ class DrafterBaseTrainer:
             self.config.rollout.drafter.training.get(
                 "collect_hidden_states_from_sgl", False
             )
+            or self.config.rollout.drafter.training.get(
+                "collect_hidden_states_from_vllm", False
+            )
         )
 
         # DataBuffer define
@@ -2979,6 +2982,9 @@ class DrafterBaseTrainer:
                 self.config.rollout.drafter.training.get(
                     "collect_hidden_states_from_sgl", False
                 )
+                or self.config.rollout.drafter.training.get(
+                    "collect_hidden_states_from_vllm", False
+                )
             )
             if require_sglang_positions and (
                 hidden_positions_item is None
@@ -5163,7 +5169,9 @@ class DrafterBaseTrainer:
             training_cfg.get("collect_hidden_states_from_old_logprob", False)
         )
         if not (
-            collect_hidden_states_from_sgl or collect_hidden_states_from_old_logprob
+            collect_hidden_states_from_sgl
+            or collect_hidden_states_from_old_logprob
+            or training_cfg.get("collect_hidden_states_from_vllm", False)
         ):
             logger.debug(
                 f"[DrafterTrainer rank {self.rank}] Skipping training step {step} "

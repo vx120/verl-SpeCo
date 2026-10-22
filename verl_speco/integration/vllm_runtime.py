@@ -37,6 +37,7 @@ from typing import Any, Iterable, cast
 
 from verl_speco.integration.verl_npu_vllm_compat import (
     install_verl_npu_vllm_import_compat,
+    install_verl_vllm_fp8_import_compat,
 )
 from verl_speco.trainer.checkpoint import trim_process_host_memory
 
@@ -265,6 +266,12 @@ def _resolve_torch_rebuild_func(func: Any):
 
 def _speco_rebuild_ipc_compat(handle: tuple[Any, tuple], device_id: int | None = None):
     func, args = handle
+    rebuild = _resolve_torch_rebuild_func(func)
+    if (
+        getattr(rebuild, "__module__", "") == "torch.multiprocessing.reductions"
+        and getattr(rebuild, "__name__", "") == "rebuild_tensor"
+    ):
+        return rebuild(*args)
     list_args = list(args)
     if device_id is not None:
         if len(list_args) <= 6:
@@ -272,7 +279,7 @@ def _speco_rebuild_ipc_compat(handle: tuple[Any, tuple], device_id: int | None =
                 f"IPC rebuild args do not include a device id slot: len={len(list_args)}"
             )
         list_args[6] = device_id
-    return _resolve_torch_rebuild_func(func)(*list_args)
+    return rebuild(*list_args)
 
 
 setattr(_speco_rebuild_ipc_compat, "_speco_compat", True)
@@ -1614,6 +1621,7 @@ def patch_transformers_attention_layer_type_constants() -> bool:
 # worker runtime hooks run. Install both import guards before any top-level
 # verl/vLLM import below, including Worker_TP extension class resolution.
 patch_transformers_attention_layer_type_constants()
+install_verl_vllm_fp8_import_compat()
 install_verl_npu_vllm_import_compat()
 
 
@@ -2311,6 +2319,15 @@ def _build_speco_vllm_stat_logger(server: Any):
 
 def _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg: Any) -> None:
     drafter_cfg = _load_env_drafter_config()
+    training = drafter_cfg.get("training", {})
+    if training.get("vllm_hidden_capture_backend") == "connector":
+        from verl_speco.integration.connector_cotrain import engine_settings
+
+        root = _ensure_child_mapping(rollout_cfg, "engine_kwargs")
+        engine_kwargs = _ensure_child_mapping(root, "vllm")
+        for key, value in engine_settings(training).items():
+            _set_child(engine_kwargs, key, value)
+        return
     if not bool(drafter_cfg.get("enable")):
         return
 
@@ -2341,7 +2358,40 @@ def _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg: Any) -> None:
         _set_child(engine_kwargs, "enforce_eager", True)
 
 
+def _install_vllm_pause_generation_compat(engine: Any) -> None:
+    pause = getattr(engine, "pause_generation", None)
+    if not callable(pause):
+        return
+    parameters = inspect.signature(pause).parameters
+    if "mode" not in parameters or "wait_for_inflight_requests" in parameters:
+        return
+
+    async def pause_compat(
+        *, wait_for_inflight_requests=False, clear_cache=True, mode=None
+    ):
+        return await pause(
+            mode=mode or ("wait" if wait_for_inflight_requests else "abort"),
+            clear_cache=clear_cache,
+        )
+
+    engine.pause_generation = pause_compat
+
+
+def _apply_vllm_boolean_launch_overrides(args: Any, config: Any) -> None:
+    """Preserve explicit false flags dropped by verl's CLI conversion."""
+    for key in ("enable_prefix_caching", "enable_chunked_prefill"):
+        value = _get_nested(config, (key,), None)
+        if value is not None:
+            setattr(args, key, bool(value))
+    value = _get_nested(config, ("engine_kwargs", "vllm", "async_scheduling"), None)
+    if value is not None:
+        args.async_scheduling = bool(value)
+
+
 class _SpecoVLLMHttpServerMixin:
+    async def set_speco_capture_step(self, global_step: int) -> None:
+        self._speco_capture_global_step = int(global_step)
+
     def _speco_pop_vllm_spec_decode_stats(self) -> dict[str, float]:
         stats = getattr(self, "_speco_vllm_spec_decode_pending_stats", None)
         if not isinstance(stats, dict):
@@ -2357,19 +2407,30 @@ class _SpecoVLLMHttpServerMixin:
         extra_fields.update(_vllm_spec_decode_stats_to_metrics(stats))
 
     async def launch_server(self, *args, **kwargs):
+        drafter_payload = getattr(self, "_speco_drafter_config_env", "")
+        if drafter_payload:
+            os.environ[SPECO_DRAFTER_CONFIG_ENV] = drafter_payload
         self._speco_vllm_spec_decode_pending_stats = _new_vllm_spec_decode_stats()
         drafter_cfg = _load_env_drafter_config()
+        training_cfg = drafter_cfg.get("training", {}) or {}
+        self._speco_vllm_hidden_capture_enabled = bool(
+            training_cfg.get("collect_hidden_states_from_vllm", False)
+        )
         self._speco_initial_draft_weights_required = bool(
             drafter_cfg.get("enable")
+            and training_cfg.get("vllm_hidden_capture_backend") != "connector"
             and _speculative_method_from_drafter(drafter_cfg) in {"dflash", "dspark"}
         )
         self._speco_initial_draft_weights_ready = False
         self._speco_initial_draft_weights_lock = None
         install_vllm_runtime_observability()
         _ensure_vllm_drafter_speculative_config_from_env(self.config)
-        return await super().launch_server(*args, **kwargs)
+        result = await super().launch_server(*args, **kwargs)
+        _install_vllm_pause_generation_compat(getattr(self, "engine", None))
+        return result
 
     async def run_server(self, args):
+        _apply_vllm_boolean_launch_overrides(args, self.config)
         try:
             import inspect
 
@@ -2431,11 +2492,104 @@ class _SpecoVLLMHttpServerMixin:
             self._speco_initial_draft_weights_ready = True
 
     async def generate(self, *args, **kwargs):
+        drafter = _load_env_drafter_config()
+        if (
+            drafter.get("training", {}).get("vllm_hidden_capture_backend")
+            == "connector"
+        ):
+            from verl_speco.integration.connector_cotrain import generate_sample
+
+            return await generate_sample(
+                self, super().generate, drafter, *args, **kwargs
+            )
         await self._speco_ensure_initial_draft_weights()
-        output = await super().generate(*args, **kwargs)
+        capture_context = None
+        capture_skip_reason = None
+        if bool(getattr(self, "_speco_vllm_hidden_capture_enabled", False)):
+            from verl_speco.integration.vllm_hidden_capture import (
+                activate_vllm_hidden_capture,
+                build_vllm_hidden_capture_context,
+            )
+
+            prompt_ids = kwargs.get("prompt_ids", args[0] if args else [])
+            sampling_params = kwargs.get(
+                "sampling_params", args[1] if len(args) > 1 else {}
+            )
+            request_id = kwargs.get("request_id", args[2] if len(args) > 2 else "")
+            try:
+                capture_context, capture_skip_reason = (
+                    build_vllm_hidden_capture_context(
+                        engine=self.engine,
+                        drafter_config=_load_env_drafter_config(),
+                        prompt_ids=list(prompt_ids),
+                        sampling_params=sampling_params,
+                        request_id=str(request_id),
+                        global_step=int(
+                            getattr(self, "_speco_capture_global_step", 0) or 0
+                        ),
+                        replica_rank=int(getattr(self, "replica_rank", 0) or 0),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "vLLM hidden-state capture skipped for request %s: %s",
+                    request_id,
+                    exc,
+                )
+                capture_context = None
+                capture_skip_reason = f"capture_setup_failed:{type(exc).__name__}"
+            capture_scope = activate_vllm_hidden_capture(self.engine, capture_context)
+        else:
+            capture_scope = nullcontext()
+        with capture_scope:
+            output = await super().generate(*args, **kwargs)
         extra_fields = getattr(output, "extra_fields", None)
         if isinstance(extra_fields, dict):
             self._speco_add_vllm_spec_decode_extra_fields(extra_fields)
+            if bool(getattr(self, "_speco_vllm_hidden_capture_enabled", False)):
+                from verl_speco.integration.vllm_hidden_capture import (
+                    vllm_capture_metrics,
+                    vllm_capture_to_drafter_sample,
+                )
+
+                token_ids = list(getattr(output, "token_ids", None) or [])
+                sample = (
+                    None
+                    if capture_context is None
+                    else vllm_capture_to_drafter_sample(capture_context, token_ids)
+                )
+                extra_fields["drafter_sample"] = sample
+                if sample is None:
+                    logger.warning(
+                        "[speco capture] no sample request=%s step=%s reason=%s",
+                        request_id,
+                        getattr(self, "_speco_capture_global_step", 0),
+                        capture_skip_reason
+                        or getattr(capture_context, "skip_reason", None),
+                    )
+                else:
+                    logger.info(
+                        "[speco capture] request=%s step=%s owner=%s shape=%s positions=[%s,%s)",
+                        request_id,
+                        sample["global_step"],
+                        sample["replica_rank"],
+                        tuple(sample["hidden_states"].shape),
+                        sample["hidden_position_start"],
+                        sample["hidden_position_end"],
+                    )
+                extra_fields.update(
+                    vllm_capture_metrics(capture_context, capture_skip_reason)
+                )
+        if (
+            isinstance(extra_fields, dict)
+            and extra_fields.get("drafter_sample") is not None
+        ):
+            from verl_speco.integration.live_hidden_transport import put_hidden
+
+            extra_fields["drafter_sample"] = put_hidden(
+                extra_fields["drafter_sample"],
+                _load_env_drafter_config().get("training", {}),
+            )
         return output
 
 
@@ -2446,7 +2600,10 @@ def _build_speco_vllm_http_server_class(upstream_module: Any):
     return type(
         "SpecoVLLMHttpServer",
         (_SpecoVLLMHttpServerMixin, upstream_cls),
-        {"__module__": __name__},
+        {
+            "__module__": __name__,
+            "_speco_drafter_config_env": os.getenv(SPECO_DRAFTER_CONFIG_ENV, ""),
+        },
     )
 
 
@@ -2866,7 +3023,59 @@ except Exception:  # noqa: BLE001
     _VLLMWorkerExtensionBase = object
 
 
-class SpecoVLLMWeightSyncCompatExtension(_VLLMWorkerExtensionBase):
+def _canonicalize_tied_weight_bucket(
+    weights: list[tuple[str, Any]], *, tied: bool
+) -> list[tuple[str, Any]]:
+    """Load a tied LM-head alias through its canonical embedding parameter."""
+
+    if not tied:
+        return weights
+    canonical_name = "model.embed_tokens.weight"
+    alias_name = "lm_head.weight"
+    names = {str(name) for name, _ in weights}
+    canonical_present = canonical_name in names
+    normalized = []
+    for name, tensor in weights:
+        if name != alias_name:
+            normalized.append((name, tensor))
+        elif not canonical_present:
+            normalized.append((canonical_name, tensor))
+    return normalized
+
+
+def _speco_target_uses_tied_embeddings(worker: Any) -> bool:
+    runner = getattr(worker, "model_runner", None)
+    target_model = getattr(runner, "model", None)
+    lm_head_weight = getattr(getattr(target_model, "lm_head", None), "weight", None)
+    base_model = getattr(target_model, "model", None)
+    embed_weight = getattr(getattr(base_model, "embed_tokens", None), "weight", None)
+    if lm_head_weight is not None and embed_weight is not None:
+        if lm_head_weight is embed_weight:
+            return True
+        try:
+            return int(lm_head_weight.data_ptr()) == int(embed_weight.data_ptr())
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return False
+
+    vllm_config = getattr(runner, "vllm_config", None)
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    return bool(getattr(hf_config, "tie_word_embeddings", False))
+
+
+class _SpecoTiedTargetWeightCompat:
+    def _update_weights(self, weights, peft_config, base_sync_done):
+        if not (peft_config and base_sync_done):
+            weights = _canonicalize_tied_weight_bucket(
+                weights,
+                tied=_speco_target_uses_tied_embeddings(self),
+            )
+        return super()._update_weights(weights, peft_config, base_sync_done)
+
+
+class SpecoVLLMWeightSyncCompatExtension(
+    _SpecoTiedTargetWeightCompat, _VLLMWorkerExtensionBase
+):
     """Install the serialized NPU IPC-handle compatibility before target weight sync."""
 
     def update_weights_from_ipc(
@@ -2902,7 +3111,9 @@ class SpecoVLLMWeightSyncCompatExtension(_VLLMWorkerExtensionBase):
             trim_process_host_memory()
 
 
-class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
+class SpecoVLLMColocateWorkerExtension(
+    _SpecoTiedTargetWeightCompat, _VLLMWorkerExtensionBase
+):
     """vLLM worker extension that can update only the speculative draft model."""
 
     _speco_draft_level2_snapshot: dict[str, Any] | None = None
@@ -3037,6 +3248,13 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
     def _speco_is_dspark_algorithm(self) -> bool:
         """Identify DSpark independently of Ascend's MRV1 ``dflash`` alias."""
 
+        if (
+            _load_env_drafter_config()
+            .get("training", {})
+            .get("vllm_hidden_capture_backend")
+            == "connector"
+        ):
+            return False
         if self._speco_draft_method() == "dspark":
             return True
         if _drafter_algorithm(_load_env_drafter_config()) == "DSPARK":

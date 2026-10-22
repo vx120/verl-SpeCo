@@ -908,14 +908,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     ) -> CollectionPlan:
         self._speco_last_collection_outcome = None
         training_cfg = self._speco_drafter_training_config()
-        source_enabled = bool(
-            training_cfg.get(
-                "collect_hidden_states_from_sgl"
-                if source is DrafterCollectionSource.SGLANG
-                else "collect_hidden_states_from_old_logprob",
-                False,
-            )
-        )
+        source_config_key = {
+            DrafterCollectionSource.SGLANG: "collect_hidden_states_from_sgl",
+            DrafterCollectionSource.VLLM: "collect_hidden_states_from_vllm",
+            DrafterCollectionSource.OLD_LOGPROB: (
+                "collect_hidden_states_from_old_logprob"
+            ),
+        }[source]
+        source_enabled = bool(training_cfg.get(source_config_key, False))
         plan = self._speco_get_drafter_scheduler().plan_collection(
             DrafterCollectionContext(
                 global_step=self.global_steps,
@@ -1033,6 +1033,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             plan,
             payload,
         )
+        from verl_speco.integration.live_hidden_transport import release_collection
+
+        release_collection(payload)
         self._speco_last_collection_outcome = outcome
         if plan.source is DrafterCollectionSource.OLD_LOGPROB:
             self._speco_last_oldlogprob_collect_rpc_elapsed_sec = outcome.elapsed_sec
@@ -1708,9 +1711,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_collect_generation_samples(self, gen_batch_output: Any) -> int:
         self._speco_last_raw_drafter_samples = 0
         self._speco_last_collected_samples = 0
-        collection_plan = self._speco_plan_drafter_collection(
-            DrafterCollectionSource.SGLANG
+        rollout_name = str(
+            _get_nested(self.config, ("actor_rollout_ref", "rollout", "name"), "") or ""
+        ).lower()
+        training_cfg = self._speco_drafter_training_config()
+        source = (
+            DrafterCollectionSource.VLLM
+            if rollout_name == "vllm"
+            and bool(training_cfg.get("collect_hidden_states_from_vllm", False))
+            else DrafterCollectionSource.SGLANG
         )
+        collection_plan = self._speco_plan_drafter_collection(source)
         self._speco_log_drafter_collection_plan(collection_plan)
         self._speco_last_collect_interval_matched = int(
             collection_plan.collect_interval_matched
@@ -1727,7 +1738,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         num_replicas = self._speco_num_rollout_replicas(samples)
         dispatch_bucket_count = self._speco_dispatch_bucket_count()
         payload = self._speco_get_drafter_scheduler().prepare_collection_payload(
-            source=DrafterCollectionSource.SGLANG,
+            source=source,
             samples=samples,
             owner_count=num_replicas,
             dispatch_bucket_count=dispatch_bucket_count,
@@ -2124,6 +2135,29 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         *,
         after_weight_update: bool = False,
     ) -> dict[str, Any]:
+        training = self._speco_drafter_training_config()
+        if training.get("vllm_hidden_capture_backend") == "connector":
+            if not training.get("connector_train_only", False):
+                raise RuntimeError(
+                    "Connector extraction cannot publish DSpark weights into its extraction engine"
+                )
+            saved = False
+            if drafter_trained:
+                results = self._speco_save_drafter_checkpoint(wait=True)
+                if results is None:
+                    raise RuntimeError(
+                        "B train-only variant requires a saved drafter checkpoint"
+                    )
+                saved = True
+                logger.info(
+                    "[connector train-only checkpoint] step=%s saved=1 inference_published=0",
+                    self.global_steps,
+                )
+            return {
+                "drafter/connector_train_only": 1,
+                "drafter/train_only_checkpoint_saved": int(saved),
+                "drafter/published": 0,
+            }
         scheduler = self._speco_get_drafter_scheduler()
         if getattr(scheduler, "_publish_executor", None) is None:
             self._speco_bind_publish_executor()
@@ -2356,6 +2390,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         def generate_sequences_with_speco(manager_self, *args, **kwargs):
             self._speco_wait_pending_drafter_publish()
+            server_manager = getattr(self, "llm_server_manager", None)
+            server_handles = getattr(server_manager, "server_handles", None)
+            if server_handles:
+                manager_self.server_handles = server_handles
             gen_batch_output = original_generate_sequences(*args, **kwargs)
             is_validation_generation = _speco_is_validation_generation(
                 args, kwargs, gen_batch_output

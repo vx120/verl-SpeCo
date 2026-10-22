@@ -101,6 +101,12 @@ class SGLangCollectionAdapter:
         )
 
 
+class VLLMCollectionAdapter(SGLangCollectionAdapter):
+    """Route captures by producing rollout replica."""
+
+    source = DrafterCollectionSource.VLLM
+
+
 class OldLogProbCollectionAdapter:
     source = DrafterCollectionSource.OLD_LOGPROB
 

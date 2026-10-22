@@ -1050,7 +1050,9 @@ class SpecoWorker(Worker):
             ):
                 if key in sample:
                     batch[key] = sample[key]
-            hidden = sample.get("hidden_states")
+            from verl_speco.integration.live_hidden_transport import get_hidden
+
+            hidden = get_hidden(sample, self.config.rollout.drafter.training)
             if hidden is None:
                 hidden_chunks = sample.get("hidden_states_ref_chunks")
                 if hidden_chunks:

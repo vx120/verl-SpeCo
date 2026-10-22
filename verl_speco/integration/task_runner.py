@@ -86,9 +86,12 @@ def _install_vllm_import_compat_for_task_runner(config) -> bool:
         return False
     from verl_speco.integration.verl_npu_vllm_compat import (
         install_verl_npu_vllm_import_compat,
+        install_verl_vllm_fp8_import_compat,
     )
 
-    return install_verl_npu_vllm_import_compat()
+    fp8_import_compat = install_verl_vllm_fp8_import_compat()
+    npu_import_compat = install_verl_npu_vllm_import_compat()
+    return fp8_import_compat or npu_import_compat
 
 
 class SpecoTaskRunner(_TaskRunnerBase):
@@ -281,5 +284,15 @@ class SpecoTaskRunner(_TaskRunnerBase):
             speco_worker_cls=speco_worker_cls,
         )
 
-        trainer.init_workers()
-        trainer.fit()
+        from verl_speco.integration.transferqueue_bridge import (
+            init_transfer_queue,
+            close_transfer_queue,
+        )
+
+        tq_started = init_transfer_queue(config)
+        try:
+            trainer.init_workers()
+            trainer.fit()
+        finally:
+            if tq_started:
+                close_transfer_queue()
