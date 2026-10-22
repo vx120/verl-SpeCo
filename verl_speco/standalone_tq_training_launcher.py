@@ -72,6 +72,12 @@ _PRODUCER_HIDDEN_DTYPE_KEY = "speco.standalone_tq_producer.hidden_dtype"
 _DSPARK_L1_LOSS_ALPHA_KEY = (
     "actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha"
 )
+_DSPARK_CONFIDENCE_LOSS_ALPHA_KEY = (
+    "actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha"
+)
+_DSPARK_CE_TARGET_SOURCE_KEY = (
+    "actor_rollout_ref.rollout.drafter.training.ce_target_source"
+)
 _ALGORITHM_TARGET_LAYER_IDS_KEYS = {
     "EAGLE3": "actor_rollout_ref.rollout.drafter.training.eagle3_target_layer_ids",
     "DFLASH": "actor_rollout_ref.rollout.drafter.training.dflash_target_layer_ids",
@@ -136,6 +142,7 @@ _INTERNAL_OVERRIDE_KEYS = frozenset(
         f"{_TQ_PREFIX}.backend.SimpleStorage.total_storage_size",
         f"{_TQ_PREFIX}.backend.SimpleStorage.num_data_storage_units",
         f"{_TQ_PREFIX}.expected_feature.algorithm",
+        f"{_TQ_PREFIX}.expected_feature.payload_kind",
         f"{_TQ_PREFIX}.expected_feature.target_model_path",
         f"{_TQ_PREFIX}.expected_feature.target_revision",
         f"{_TQ_PREFIX}.expected_feature.tokenizer_fingerprint",
@@ -949,24 +956,71 @@ def build_pipeline_commands(
         f"{_FEATURE_STORE_PREFIX}.repeat=false",
         *tq_overrides,
     ]
+    hidden_references = (
+        _strip_quotes(_find_override(training_args, _RUNTIME_BACKEND_KEY) or "ray")
+        == "ray"
+    )
+    if hidden_references:
+        consumer_internal.extend(
+            item.replace(
+                f"{_PRODUCER_PREFIX}.hidden_states_store",
+                "actor_rollout_ref.rollout.drafter.training.target_feature_replay.hidden_states_store",
+            )
+            for item in _hidden_states_store_overrides(backend_env)
+        )
+        owner = []
+        consumer_internal[0] = f"{_FEATURE_STORE_PREFIX}.type=ray_reference"
+        producer_overrides.extend(
+            [
+                f"{_FEATURE_STORE_PREFIX}.type=ray_reference",
+                f"{_TQ_PREFIX}.enable=false",
+            ]
+        )
+        consumer_internal.append(f"{_TQ_PREFIX}.enable=false")
+        kind_override = f"{_TQ_PREFIX}.expected_feature.payload_kind=vllm_reference"
+        producer_overrides.append(kind_override)
+        consumer_internal.append(kind_override)
+        depth_key = f"{_TQ_PREFIX}.consumer_prefetch_batches"
+        requested_depth = _find_override(training_args, depth_key, normalize_key=True)
+        if requested_depth is not None and int(_strip_quotes(requested_depth)) < 1:
+            raise ValueError(
+                "Standalone vLLM file input requires consumer_prefetch_batches >= 1"
+            )
+        if requested_depth is None:
+            consumer_internal.append(f"{depth_key}=4")
     hidden_dtype = _strip_quotes(
         _find_override(training_args, _PRODUCER_HIDDEN_DTYPE_KEY) or "bfloat16"
     )
-    dspark_l1_loss_alpha = float(
-        _strip_quotes(_find_override(training_args, _DSPARK_L1_LOSS_ALPHA_KEY) or "0.9")
+    # The Producer's collected layout and the Consumer's expected layout must
+    # agree, so resolve the loss settings that select it (dflash_aux vs
+    # dflash_aux_plus_last) once here and forward the same values to both.
+    dspark_l1_loss_alpha = _strip_quotes(
+        _find_override(training_args, _DSPARK_L1_LOSS_ALPHA_KEY, normalize_key=True)
+        or "0.9"
+    )
+    dspark_confidence_loss_alpha = _strip_quotes(
+        _find_override(
+            training_args, _DSPARK_CONFIDENCE_LOSS_ALPHA_KEY, normalize_key=True
+        )
+        or "0.0"
+    )
+    ce_target_source = _strip_quotes(
+        _find_override(training_args, _DSPARK_CE_TARGET_SOURCE_KEY, normalize_key=True)
+        or "labels"
+    )
+    producer_overrides.extend(
+        [
+            f"{_DSPARK_L1_LOSS_ALPHA_KEY}={dspark_l1_loss_alpha}",
+            f"{_DSPARK_CONFIDENCE_LOSS_ALPHA_KEY}={dspark_confidence_loss_alpha}",
+            f"{_DSPARK_CE_TARGET_SOURCE_KEY}={ce_target_source}",
+        ]
     )
     hidden_layout = resolve_drafter_hidden_states_layout(
         config.algorithm,
         {
-            "dspark_l1_loss_alpha": dspark_l1_loss_alpha,
-            "ce_target_source": _strip_quotes(
-                _find_override(
-                    training_args,
-                    "actor_rollout_ref.rollout.drafter.training.ce_target_source",
-                    normalize_key=True,
-                )
-                or "labels"
-            ),
+            "dspark_l1_loss_alpha": float(dspark_l1_loss_alpha),
+            "dspark_confidence_loss_alpha": float(dspark_confidence_loss_alpha),
+            "ce_target_source": ce_target_source,
         },
     )
     consumer_internal.extend(
@@ -1233,6 +1287,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if runtime_backend not in {"subprocess", "ray"}:
         parser.error(f"{_RUNTIME_BACKEND_KEY} must be either subprocess or ray")
+    # Keep command composition consistent with the explicit CLI backend too.
+    training_args = [*training_args, f"{_RUNTIME_BACKEND_KEY}={runtime_backend}"]
 
     try:
         config = resolve_pipeline_config(training_args)
@@ -1251,6 +1307,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ("consumer", commands.consumer),
             ]
             for role, command in printable_commands:
+                if role == "owner" and not command:
+                    continue
                 if command is None:
                     print(
                         f"{role}: external services at "

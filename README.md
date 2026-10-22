@@ -13,6 +13,10 @@ training, and hot-update logic through `verl_speco`.
 - **Drafter Co-Training in the RL loop**: collects hidden states during rollout or
   old-logprob computation, trains a drafter periodically, and publishes updated
   drafter weights back to the rollout engine.
+- **Bubble Time drafter training**: can run drafter optimizer steps on rollout
+  idle workers, then publish the trained drafter back to all rollout replicas,
+  so the generation benefit is preserved while less drafter training time lands
+  on the critical path.
 - **Multiple drafter backends**: includes EAGLE-1, EAGLE-2, EAGLE3, DFlash,
   DSpark, Domino, and P-EAGLE trainer backends under `verl_speco.backends`.
 - **vLLM and SGLang integration**: supports EAGLE-1, EAGLE-2, EAGLE3, DFlash,
@@ -35,12 +39,17 @@ For the online drafter collection, training, and publish scheduling boundary,
 including how to add a new execution or collection strategy, see the
 [Drafter Scheduler guide](docs/drafter_scheduler.md).
 
+For the rollout-idle Bubble Time execution path, including the quota lifecycle,
+safe writer switching, key metrics, and recommended configuration, see
+[Bubble Time drafter training](docs/bubble_time_drafter_training.md).
+For a paired 4-GPU DSpark/vLLM launch, use the
+[Bubble/Sync example](examples/bubble_time/run_qwen3-8b_drafter_dspark_vllm.sh).
+
 ## Performance Preview
 
-The current results focus on EAGLE3 with the vLLM rollout engine, where
-verl-SpeCo supports both GPU and NPU deployments. The figures below show a
-Qwen3-8B EAGLE3 run on vLLM-Ascend/NPU; DFlash support is available, and DFlash
-figures will be added in a later update.
+The current results cover both NPU EAGLE3 co-training and GPU DFlash Bubble
+Time training. Bubble Time uses rollout idle windows to repay drafter-training
+quota instead of reducing the requested drafter optimizer work.
 
 On Qwen3-8B with an EAGLE3 drafter on vLLM-Ascend/NPU, a 100-step run shows
 that co-training increases mean acceptance length over the fixed-drafter setting
@@ -54,6 +63,19 @@ faster end-to-end training without accuracy regression.
 | Step Time | Critic Reward |
 | --- | --- |
 | ![Qwen3-8B EAGLE3 step time on vLLM-Ascend](docs/assets/qwen3-8b_eagle3_npu_step.png) | ![Qwen3-8B EAGLE3 critic reward on vLLM-Ascend](docs/assets/qwen3-8b_eagle3_npu_critic-reward.png) |
+
+On a Qwen3-4B DFlash GPU run, Bubble Time kept the drafter training quota
+aligned with the synchronous path while moving most drafter work off the main
+critical path. Excluding checkpoint-save steps, the observed end-to-end step
+time improved by about 6.7% compared with synchronous drafter training, with
+similar speculative-decoding acceptance length.
+
+| Metric | Sync drafter training | Bubble Time | Change |
+| --- | ---: | ---: | ---: |
+| End-to-end step time, excluding checkpoint-save steps | 123.52 s | 115.23 s | 6.7% faster |
+| Drafter time on the critical path | 8.33 s | 2.08 s | 75.0% lower |
+| Generation time | 49.47 s | 47.43 s | 4.1% faster |
+| Mean acceptance length | 3.30 | 3.25 | Similar |
 
 ## Draft Model Support
 
@@ -140,10 +162,45 @@ DFlash compatibility patches.
 This integration deliberately supports fixed verification length only. Native
 MRV2 does not expose the MRV1 confidence-head/dynamic-length contract, so keep
 `dspark_confidence_loss_alpha=0`, do not publish confidence-head tensors, and
-do not enable dynamic verification length. The Qwen checkpoint must declare
+do not enable dynamic verification length. The MRV1 vLLM path and the standalone
+trainer do support confidence-head training: set `dspark_confidence_loss_alpha>0`
+(optionally `dspark_confidence_head_with_markov`) to train the per-position
+acceptance head against `alpha = sum_v min(p_v, q_v) = 1 - TV`, matching
+`speculators`. The Qwen checkpoint must declare
 `architectures=["Qwen3DSparkModel"]` and use `sample_from_anchor=true` (or omit
 it for the native default); the fixed verification length must not exceed the
 checkpoint's training `block_size`.
+
+### verl V1 runner (Phase 1)
+
+On `release/v0.9.0`, SPECO can now enter verl's native V1
+`TransferQueue` trainer with `trainer.use_v1=true`. Fixed-drafter serving and
+online DSpark drafter training support `sync`, `colocate_async`, and
+`separate_async` with vLLM rollout. The adapter preserves the configured
+agent-loop manager while wrapping vLLM actor workers with SPECO's runtime
+compatibility and draft-weight publication hooks. It does not add Uni-Agent
+fields.
+
+Use the Phase 1 overlay from a checkout that exposes the `verl` config package:
+
+```bash
+export PYTHONPATH=/path/to/verl:/path/to/verl-SpeCo
+python -m verl_speco.main --config-name=speco_v1_trainer \
+  actor_rollout_ref.model.path=/path/to/target \
+  data.train_files=/path/to/train.parquet \
+  data.val_files=/path/to/val.parquet \
+  trainer.v1.trainer_mode=sync
+```
+
+For every supported V1 mode, online drafter training uses the same
+old-logprob collector, scheduler, feature store, and weight-publication
+protocol as the legacy trainer, with V1's `KVBatchMeta`/TransferQueue boundary
+preserved. Start with ordinary single-turn PPO/GRPO batches and the existing
+fixed feature window. Agent trajectories, per-turn masking, context-plus-
+assistant layouts, and sliding-window-aware training are Phase 2 work; do not
+enable those options with this overlay yet. Online drafter training requires
+actor old-logprob inference, so it rejects
+`algorithm.rollout_correction.bypass_mode=true`.
 
 ### VeOmni Actor Compatibility
 
@@ -368,6 +425,47 @@ The main mode values are:
 
 Offline training supports every drafter family the online workers support:
 EAGLE-1, EAGLE-2, EAGLE-3, DFlash, DSpark, Domino and P-EAGLE.
+
+DSpark offline training can additionally train the confidence head used for
+dynamic draft-length thresholding. Set `dspark_confidence_loss_alpha>0` (for
+example `0.2`) and the head is created automatically from the target's final
+hidden state; `dspark_confidence_head_with_markov` keeps the Markov previous-token
+embedding in the head input (default `true`). A positive value on either
+`dspark_confidence_head_alpha` or `dspark_confidence_loss_alpha` enables the head,
+while only `dspark_confidence_loss_alpha` weights its BCE term. The BCE target
+tracks the served proposal mode via `dspark_confidence_target_mode`: `greedy`
+(the serving default, one-hot draft) targets `p_target[argmax(p_draft)]`, while
+`probabilistic` targets `1 - TV = sum_v min(p_draft_v, p_target_v)`. Training the
+confidence head requires the target's final hidden state, so the DSpark hidden
+state collection switches to `dflash_aux_plus_last` whenever either it or the L1
+loss is enabled. The standalone scripts expose `DSPARK_CONFIDENCE_HEAD_ALPHA`,
+`DSPARK_CONFIDENCE_HEAD_WITH_MARKOV`, and `DSPARK_CONFIDENCE_LOSS_ALPHA`.
+
+Online co-training (`actor_rollout_ref.rollout.drafter.enable_drafter_training`)
+trains and hot-publishes the same head on the MRV1 path. The checkpoint's
+confidence topology is authoritative: the loader infers whether the head input
+includes the Markov embedding from the checkpoint tensor shape, and a training
+setting that disagrees (or a checkpoint carrying only half of
+`confidence_head.proj.{weight,bias}`) fails closed instead of silently loading
+an incompatible head. The vLLM engine registers the head only when the
+checkpoint declares `enable_confidence_head` and sizes it from
+`confidence_head_with_markov`, so any exported topology loads with the right
+shape. The vLLM-Ascend confidence-thresholded dynamic verify budget
+(`dynamic_spec_config.method=dspark`) assumes a Markov-fused head, so a
+markov-less head (`dspark_confidence_head_with_markov=false` with
+`dspark_markov_rank>0`) is rejected while that dynamic path is configured;
+static serving and offline training (`...training.mode=offline`) may be
+markov-less. The exported `config.json` always records the live topology, so a
+head added while fine-tuning an older checkpoint survives a reload. Enabling
+vLLM-Ascend's confidence-thresholded dynamic verify budget is
+opt-in: on the V1 runner through
+`rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method=dspark`
+(`VLLM_USE_V2_MODEL_RUNNER=0`, requires vllm-ascend#13216, and
+`async_scheduling=False` — the V1 budget consumer is only called when async is
+off), or on the MRV2 runner through
+`rollout.drafter.vllm.speculative_config_overrides.enable_adaptive_verification=true`
+(vllm-ascend#15098, async-compatible); see
+`examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_vllm_npu.sh`.
 
 Domino and P-EAGLE are training-time families with no engine-level speculative
 method of their own (engines serve Domino as a DFlash projector sub-mode, and

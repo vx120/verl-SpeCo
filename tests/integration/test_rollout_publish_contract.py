@@ -17,6 +17,7 @@ import asyncio
 from inspect import getsource
 from types import SimpleNamespace
 
+from omegaconf import OmegaConf
 import pytest
 
 from verl_speco.integration import rollout_publish
@@ -26,12 +27,129 @@ class _FakeObjectRef:
     pass
 
 
+@pytest.mark.parametrize(
+    "overlay", ["class_metadata", "legacy_class_metadata", "config"]
+)
+def test_head_export_capability_supports_legacy_worker_overlay(monkeypatch, overlay):
+    import json
+
+    class Worker(SimpleNamespace):
+        pass
+
+    drafter = {
+        "training": {"scheduler": {"execution": {"strategy": "rollout_idle_worker"}}}
+    }
+    setattr(
+        Worker,
+        "_speco_sglang_drafter_config_env"
+        if overlay == "legacy_class_metadata"
+        else "_speco_drafter_config_env",
+        json.dumps(drafter),
+    )
+    config = {"actor": {"strategy": "fsdp2"}, "model": {}, "rollout": {}}
+    if overlay == "config":
+        config["rollout"]["drafter"] = drafter
+    worker = Worker(config=config, _is_actor=True, actor=object(), rank=0)
+    tensor = object()
+    monkeypatch.setattr(
+        rollout_publish, "_actor_module_candidates", lambda worker: [object()]
+    )
+    monkeypatch.setattr(
+        rollout_publish,
+        "_select_lm_head_named_tensor",
+        lambda module: ("model.lm_head.weight", tensor),
+    )
+    capability = (
+        rollout_publish.DraftWeightPublishMixin.get_actor_lm_head_export_capability(
+            worker
+        )
+    )
+    assert capability["supported"] and capability["reason"] == "head_only_ready"
+    assert rollout_publish._head_only_export_candidate(worker)[1] is tensor
+
+
+@pytest.mark.parametrize("failure", ["sync", "missing_head", "lora"])
+def test_head_export_capability_rejects_unsafe_layouts(monkeypatch, failure):
+    config = {
+        "actor": {"strategy": "fsdp2"},
+        "model": {},
+        "rollout": {
+            "drafter": {
+                "training": {
+                    "scheduler": {"execution": {"strategy": "rollout_idle_worker"}}
+                }
+            }
+        },
+    }
+    if failure == "sync":
+        config["rollout"]["drafter"]["training"]["scheduler"]["execution"][
+            "strategy"
+        ] = "sync"
+    if failure == "lora":
+        config["model"]["lora_rank"] = 8
+    worker = SimpleNamespace(config=config, _is_actor=True, actor=object(), rank=0)
+    monkeypatch.setattr(rollout_publish, "_actor_module_candidates", lambda worker: [])
+    capability = (
+        rollout_publish.DraftWeightPublishMixin.get_actor_lm_head_export_capability(
+            worker
+        )
+    )
+    assert not capability["supported"]
+
+
+@pytest.mark.parametrize("use_omegaconf", [False, True])
+def test_upstream_rollout_init_temporarily_hides_speco_drafter_config(
+    use_omegaconf: bool,
+) -> None:
+    config = {"rollout": {"name": "vllm", "drafter": {"enable": True}}}
+    worker = SimpleNamespace(
+        config=OmegaConf.create(config) if use_omegaconf else config
+    )
+
+    with rollout_publish._without_speco_drafter_rollout_config(worker):
+        rollout = worker.config.rollout if use_omegaconf else worker.config["rollout"]
+        assert "drafter" not in rollout
+        assert rollout["name"] == "vllm"
+
+    rollout = worker.config.rollout if use_omegaconf else worker.config["rollout"]
+    assert rollout["drafter"]["enable"] is True
+
+
 class _FakeRay:
     ObjectRef = _FakeObjectRef
 
     @staticmethod
     def get(value):
         return {"resolved": value}
+
+
+@pytest.mark.parametrize("use_omegaconf", [False, True])
+def test_vllm_replica_config_excludes_speco_drafter(use_omegaconf: bool) -> None:
+    config = {"name": "vllm", "drafter": {"enable": True}}
+    value = OmegaConf.create(config) if use_omegaconf else config
+    from verl_speco.integration.vllm_runtime import _rollout_config_without_drafter
+
+    result = _rollout_config_without_drafter(value)
+    assert "drafter" not in result
+    assert result["name"] == "vllm"
+    assert "drafter" in value
+
+
+def test_v1_agent_loop_config_excludes_speco_drafter() -> None:
+    pytest.importorskip("ray")
+    from verl_speco.integration.task_runner import SpecoTaskRunner
+
+    config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {"name": "vllm", "drafter": {"enable": True}}
+            }
+        }
+    )
+    agent_config = SpecoTaskRunner._v1_agent_loop_config(config)
+
+    assert "drafter" not in agent_config.actor_rollout_ref.rollout
+    assert config.actor_rollout_ref.rollout.drafter.enable is True
 
 
 def test_materialize_direct_and_object_ref_payloads(monkeypatch) -> None:
@@ -165,6 +283,58 @@ def test_rollout_backend_and_drafter_gates_support_both_config_shapes() -> None:
     assert not rollout_publish.drafter_rollout_enabled(
         {"actor_rollout_ref": {"rollout": {"drafter": {"enable": False}}}}
     )
+
+
+def test_bubble_publish_stages_before_safe_point_commit() -> None:
+    class _Rollout:
+        def __init__(self):
+            self.updates = []
+
+        async def update_draft_weights(self, weights, *, global_steps=None):
+            self.updates.append((weights, global_steps))
+
+    class _Worker(rollout_publish.DraftWeightPublishMixin):
+        def _attach_update_draft_weights_to_rollout(self):
+            return None
+
+    worker = _Worker()
+    worker.config = {"rollout": {"drafter": {"enable": True}}}
+    worker.rollout = _Rollout()
+
+    stage_ack = asyncio.run(
+        worker.stage_draft_weights_async({"weight": 1}, global_steps=4)
+    )
+
+    assert stage_ack["staged"] is True
+    assert stage_ack["published"] is False
+    assert worker.rollout.updates == []
+
+    commit_ack = asyncio.run(worker.commit_staged_draft_weights(global_steps=4))
+
+    assert commit_ack["published"] is True
+    assert worker.rollout.updates == [({"weight": 1}, 4)]
+
+
+def test_legacy_async_publish_still_updates_rollout_directly() -> None:
+    class _Rollout:
+        def __init__(self):
+            self.updates = []
+
+        async def update_draft_weights(self, weights, *, global_steps=None):
+            self.updates.append((weights, global_steps))
+
+    class _Worker(rollout_publish.DraftWeightPublishMixin):
+        def _attach_update_draft_weights_to_rollout(self):
+            return None
+
+    worker = _Worker()
+    worker.config = {"rollout": {"drafter": {"enable": True}}}
+    worker.rollout = _Rollout()
+
+    ack = asyncio.run(worker.update_draft_weights_async({"weight": 1}, global_steps=4))
+
+    assert ack["published"] is True
+    assert worker.rollout.updates == [({"weight": 1}, 4)]
 
 
 def test_explicit_disabled_drafter_wins_over_stale_runtime_env(monkeypatch) -> None:
@@ -303,6 +473,123 @@ def test_veomni_lm_head_export_avoids_full_engine_state_dict(
     assert tuple(payload["weight"].shape) == (expected_rows, 3)
 
 
+def test_bubble_fsdp2_full_head_export_preserves_all_rows_without_actor_enumeration() -> (
+    None
+):
+    torch = pytest.importorskip("torch")
+    module = torch.nn.Module()
+    module.lm_head = torch.nn.Linear(3, 6, bias=False)
+
+    def fail_enumeration(**kwargs):
+        raise AssertionError("full actor enumeration must not run")
+
+    worker = SimpleNamespace(
+        _is_actor=True,
+        rank=0,
+        config={
+            "actor": {"strategy": "fsdp2"},
+            "rollout": {
+                "drafter": {
+                    "training": {
+                        "scheduler": {"execution": {"strategy": "rollout_idle_worker"}}
+                    }
+                }
+            },
+        },
+        actor=SimpleNamespace(
+            engine=SimpleNamespace(module=module, get_per_tensor_param=fail_enumeration)
+        ),
+    )
+    payload = rollout_publish.export_actor_lm_head_weight(worker)
+    assert payload["export_strategy"] == "direct_full"
+    assert payload["row_indices"] is None
+    assert torch.equal(
+        payload["weight"], module.lm_head.weight.detach().to(torch.bfloat16)
+    )
+
+
+@pytest.mark.parametrize("device_name", ["cuda", "npu"])
+def test_bubble_cpu_head_export_uses_verl_device_abstraction(monkeypatch, device_name):
+    import sys
+    from types import ModuleType
+
+    device_module = ModuleType("verl.utils.device")
+    device_module.get_device_name = lambda: device_name
+    monkeypatch.setitem(sys.modules, "verl.utils.device", device_module)
+    moved = []
+
+    class Head:
+        shape = (6, 3)
+
+        def to_local(self):
+            return SimpleNamespace(device=SimpleNamespace(type="cpu"))
+
+        def to(self, *, device, **kwargs):
+            moved.append(device)
+            return self
+
+        def detach(self):
+            return self
+
+        def full_tensor(self):
+            return self
+
+        def contiguous(self):
+            return self
+
+    head = Head()
+    monkeypatch.setattr(
+        rollout_publish,
+        "_torch_module",
+        lambda: SimpleNamespace(device=lambda name: name, bfloat16="bf16"),
+    )
+    monkeypatch.setattr(
+        rollout_publish, "_is_veomni_actor_worker", lambda worker: False
+    )
+    monkeypatch.setattr(
+        rollout_publish,
+        "_head_only_export_candidate",
+        lambda worker, rows: ("lm_head.weight", head, "head_only_ready"),
+    )
+    payload = rollout_publish.export_actor_lm_head_weight(
+        SimpleNamespace(_is_actor=True, actor=object(), rank=0)
+    )
+    assert moved == [device_name, "cpu"]
+    assert payload["export_strategy"] == "direct_full"
+
+
+def test_dflash_lm_head_sparse_export_avoids_full_engine_state_dict() -> None:
+    torch = pytest.importorskip("torch")
+
+    class _Module(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = torch.nn.Linear(3, 6, bias=False)
+
+    class _Engine:
+        module = _Module()
+
+        @staticmethod
+        def get_per_tensor_param(**kwargs):
+            raise AssertionError("Sparse lm_head export must not enumerate full params")
+
+    worker = SimpleNamespace(
+        _is_actor=True,
+        rank=0,
+        config={"rollout": {"drafter": {"speculative_algorithm": "DFLASH"}}},
+        actor=SimpleNamespace(engine=_Engine()),
+    )
+
+    payload = rollout_publish.export_actor_lm_head_weight(
+        worker,
+        row_indices=[1, 4],
+    )
+
+    assert payload["export_strategy"] == "direct_sparse"
+    assert payload["selected_rows"] == 2
+    assert tuple(payload["weight"].shape) == (2, 3)
+
+
 def test_veomni_runtime_validation_checks_initialized_model_contract() -> None:
     torch = pytest.importorskip("torch")
 
@@ -422,7 +709,7 @@ def test_publish_state_filter_excludes_block_drafter_embedding() -> None:
     assert set(trainer._get_trainable_state_dict()) == {"draft_model.fc.weight"}
 
 
-def test_mrv2_dspark_publish_excludes_frozen_confidence_head(monkeypatch) -> None:
+def test_mrv2_dspark_publish_includes_confidence_head(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     torch = pytest.importorskip("torch")
     base_trainer = pytest.importorskip(
@@ -433,7 +720,10 @@ def test_mrv2_dspark_publish_excludes_frozen_confidence_head(monkeypatch) -> Non
 
     trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
     trainer.backend = SimpleNamespace(
-        model_type="dspark", trains_draft_lm_head=False, trains_draft_embeddings=False
+        model_type="dspark",
+        trains_draft_lm_head=False,
+        trains_draft_embeddings=False,
+        confidence_head_alpha=1.0,
     )
     trainer.training_device_mesh = None
     trainer._frozen_param_names = []
@@ -443,6 +733,48 @@ def test_mrv2_dspark_publish_excludes_frozen_confidence_head(monkeypatch) -> Non
             "draft_model.confidence_head.proj.bias": torch.ones(1),
             "draft_model.embed_tokens.weight": torch.ones(2, 2),
             "draft_model.lm_head.weight": torch.ones(2, 2),
+            "draft_model.markov_head.markov_w1.weight": torch.ones(2, 2),
+        }
+    )
+
+    # MRV2 (vllm-ascend#15098) now registers and consumes the confidence head,
+    # so it must enter the online update payload instead of being frozen.
+    assert set(trainer._get_trainable_state_dict()) == {
+        "draft_model.markov_head.markov_w1.weight",
+        "draft_model.confidence_head.proj.weight",
+        "draft_model.confidence_head.proj.bias",
+    }
+
+
+@pytest.mark.parametrize("runner", [None, "0", "1"])
+def test_dspark_publish_excludes_untrained_confidence_head(
+    monkeypatch,
+    runner,
+) -> None:
+    if runner is None:
+        monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", runner)
+    torch = pytest.importorskip("torch")
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="publish state filtering needs the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(
+        model_type="dspark",
+        trains_draft_lm_head=False,
+        trains_draft_embeddings=False,
+        confidence_head_alpha=0.0,
+    )
+    trainer.training_device_mesh = None
+    trainer._frozen_param_names = []
+    trainer.model = SimpleNamespace(
+        state_dict=lambda: {
+            "draft_model.confidence_head.proj.weight": torch.ones(1, 2),
+            "draft_model.confidence_head.proj.bias": torch.ones(1),
             "draft_model.markov_head.markov_w1.weight": torch.ones(2, 2),
         }
     )
@@ -527,14 +859,18 @@ def test_idle_drafter_lifecycle_offloads_dspark_target_lm_head(
     )
     trainer.model = None
     trainer.optimizer = None
+    trainer.config = SimpleNamespace(actor=SimpleNamespace(strategy="fsdp"))
+    trainer.park_hccl_after_drafter_training = False
+    trainer.buffer_version = 0
     trainer._training_active = True
     trainer._training_initialized = True
+    trainer.buffer_version = 0
+    trainer.park_hccl_after_drafter_training = False
     monkeypatch.setattr(base_trainer, "device_name", "cpu")
 
     if release_method == "cleanup_training":
         trainer._pending_checkpoint_future = None
         trainer._pending_full_checkpoint_future = None
-        trainer.skip_heavy_cleanup_after_drafter_training = False
         trainer._get_sp_group = lambda: None
         trainer._get_dp_group = lambda: None
         trainer.training_device_mesh = None
@@ -643,6 +979,8 @@ def test_dspark_pretrained_export_strips_only_training_wrapper_prefix() -> None:
             "draft_model.hidden_norm.weight": torch.ones(2),
             "draft_model.norm.weight": torch.ones(2),
             "draft_model.markov_head.markov_w1.weight": torch.ones(2, 2),
+            "draft_model.confidence_head.proj.weight": torch.ones(1, 4),
+            "draft_model.confidence_head.proj.bias": torch.ones(1),
         },
     )
 
@@ -653,7 +991,75 @@ def test_dspark_pretrained_export_strips_only_training_wrapper_prefix() -> None:
         "hidden_norm.weight",
         "norm.weight",
         "markov_head.markov_w1.weight",
+        "confidence_head.proj.weight",
+        "confidence_head.proj.bias",
     }
+
+
+def test_mrv1_dspark_publish_keeps_trainable_confidence_head(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    torch = pytest.importorskip("torch")
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="publish state filtering needs the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(
+        model_type="dspark",
+        trains_draft_lm_head=False,
+        trains_draft_embeddings=False,
+        confidence_head_alpha=1.0,
+    )
+    trainer.training_device_mesh = None
+    trainer._frozen_param_names = []
+    trainer.model = SimpleNamespace(
+        state_dict=lambda: {
+            "draft_model.confidence_head.proj.weight": torch.ones(1, 2),
+            "draft_model.confidence_head.proj.bias": torch.ones(1),
+            "draft_model.embed_tokens.weight": torch.ones(2, 2),
+            "draft_model.fc.weight": torch.ones(2, 2),
+        }
+    )
+
+    assert set(trainer._get_trainable_state_dict()) == {
+        "draft_model.confidence_head.proj.weight",
+        "draft_model.confidence_head.proj.bias",
+        "draft_model.fc.weight",
+    }
+
+
+def test_dspark_training_metrics_report_confidence_loss() -> None:
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="confidence metrics need the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(model_type="dspark")
+    trainer.config = SimpleNamespace(
+        rollout=SimpleNamespace(
+            drafter=SimpleNamespace(training={"dspark_block_size": 2})
+        )
+    )
+    trainer._training_metric_sums = {
+        "dspark/confidence_loss_sum": 3.0,
+        "dspark/confidence_weighted_token_count": 2.0,
+        "dspark/confidence_accept_rate_sum": 1.0,
+        "dspark/confidence_pred_mean_sum": 0.5,
+    }
+    trainer._training_metric_steps = 1
+    trainer.optimizer_steps_total = 0
+    trainer.optimizer = None
+
+    metrics = trainer.get_training_metrics()
+
+    assert metrics["dspark/confidence_loss"] == pytest.approx(1.5)
+    assert metrics["dspark/confidence_accept_rate"] == pytest.approx(0.5)
+    assert metrics["dspark/confidence_pred_mean"] == pytest.approx(0.25)
+    assert metrics["dspark/confidence_weighted_token_count"] == pytest.approx(2.0)
 
 
 @pytest.mark.parametrize("runner", ["0", "1"])

@@ -21,6 +21,8 @@ from types import SimpleNamespace
 from omegaconf import OmegaConf
 import pytest
 
+pytest.importorskip("torch")
+
 from verl_speco.standalone_tq_training_launcher import (
     _hidden_states_store_overrides,
     _preflight_input_file,
@@ -38,6 +40,33 @@ from verl_speco.standalone_tq_training_launcher import (
     validate_tq_backend,
 )
 import verl_speco.tq_owner as tq_owner
+
+
+@pytest.mark.parametrize("hidden_store,runtime,is_reference", [
+    ("file", "ray", True), ("mooncake", "ray", True), ("file", "subprocess", False),
+])
+def test_reference_mode_uses_existing_ray_prefetch(hidden_store, runtime, is_reference):
+    env = {"SPECO_VLLM_HIDDEN_STATES_STORE": hidden_store}
+    args = [*_training_args(), f"speco.draft_training.runtime_backend={runtime}"]
+    commands = build_pipeline_commands(
+        resolve_pipeline_config(args, environ=env), args, ray_address="10.0.0.1:6379", env=env,
+    )
+    kind = "actor_rollout_ref.rollout.drafter.training.transfer_queue.expected_feature.payload_kind=vllm_reference"
+    assert (kind in commands.producer_overrides) is is_reference
+    assert (kind in commands.consumer_overrides) is is_reference
+    if is_reference:
+        assert "actor_rollout_ref.rollout.drafter.training.transfer_queue.consumer_prefetch_batches=4" in commands.consumer_overrides
+        assert "actor_rollout_ref.rollout.drafter.training.feature_store.type=ray_reference" in commands.consumer_overrides
+        assert "actor_rollout_ref.rollout.drafter.training.feature_store.type=ray_reference" in commands.producer_overrides
+        assert "actor_rollout_ref.rollout.drafter.training.transfer_queue.enable=false" in commands.consumer_overrides
+        assert "actor_rollout_ref.rollout.drafter.training.transfer_queue.enable=false" in commands.producer_overrides
+
+
+def test_reference_mode_rejects_disabled_prefetch():
+    args = [*_training_args(), "actor_rollout_ref.rollout.drafter.training.transfer_queue.consumer_prefetch_batches=0"]
+    with pytest.raises(ValueError, match="prefetch"):
+        build_pipeline_commands(resolve_pipeline_config(args, environ={}), args,
+                                ray_address="10.0.0.1:6379", env={})
 
 
 def _training_args() -> list[str]:
@@ -129,6 +158,63 @@ def test_ce_only_target_argmax_expected_layout(prefix, source):
         item.endswith("expected_feature.hidden_states_layout=dflash_aux_plus_last")
         for item in commands.consumer_overrides
     )
+
+
+@pytest.mark.parametrize(
+    "l1_prefix,confidence_prefix",
+    [("+", "+"), ("", "++"), ("++", "")],
+)
+def test_confidence_only_expected_layout_matches_producer(l1_prefix, confidence_prefix):
+    # A confidence-only configuration (l1=0, confidence>0, ce_target_source=
+    # labels) still needs the target's final hidden state. The Consumer must
+    # therefore expect dflash_aux_plus_last AND the Producer must be told the
+    # same loss values; otherwise the two layouts disagree and the feature
+    # contract rejects the samples. The loss overrides carry arbitrary Hydra
+    # prefixes (``+``/``++``/none), which must all resolve.
+    from verl_speco.integration.oldlogprob_layer_ids import (
+        resolve_drafter_hidden_states_layout,
+    )
+
+    l1_key = "actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha"
+    confidence_key = (
+        "actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha"
+    )
+    ce_key = "actor_rollout_ref.rollout.drafter.training.ce_target_source"
+    args = _training_args() + [
+        f"{l1_prefix}{l1_key}=0",
+        f"{confidence_prefix}{confidence_key}=1.0",
+        f"+{ce_key}=labels",
+    ]
+    commands = build_pipeline_commands(
+        resolve_pipeline_config(args, environ={}),
+        args,
+        ray_address="10.0.0.1:6379",
+        python_executable="python",
+    )
+
+    # The requested loss values must reach the Producer verbatim; the previous
+    # fallback (l1=0.9) would otherwise produce dflash_aux_plus_last by luck.
+    assert f"{l1_key}=0" in commands.producer_overrides
+    assert f"{confidence_key}=1.0" in commands.producer_overrides
+    assert any(
+        item.endswith("expected_feature.hidden_states_layout=dflash_aux_plus_last")
+        for item in commands.consumer_overrides
+    )
+
+    producer_cfg: dict[str, str] = {}
+    for item in commands.producer_overrides:
+        if "=" in item:
+            key, value = item.split("=", 1)
+            producer_cfg[key.lstrip("+")] = value
+    producer_layout = resolve_drafter_hidden_states_layout(
+        "DSPARK",
+        {
+            "dspark_l1_loss_alpha": float(producer_cfg[l1_key]),
+            "dspark_confidence_loss_alpha": float(producer_cfg[confidence_key]),
+            "ce_target_source": producer_cfg[ce_key],
+        },
+    )
+    assert producer_layout == "dflash_aux_plus_last"
 
 
 def test_producer_max_samples_uses_remaining_total_steps() -> None:
@@ -325,7 +411,7 @@ def test_pipeline_commands_hide_and_replace_tq_overrides() -> None:
         python_executable="python",
     )
 
-    assert commands.owner[:3] == ["python", "-m", "verl_speco.tq_owner"]
+    assert commands.owner == []
     assert commands.vllm is not None
     assert commands.vllm[:3] == ["vllm", "serve", "/models/Qwen3-8B"]
     assert "ExampleHiddenStatesConnector" in " ".join(commands.vllm)
@@ -340,7 +426,7 @@ def test_pipeline_commands_hide_and_replace_tq_overrides() -> None:
         "-m",
         "verl_speco.draft_train_launcher",
     ]
-    assert any(item.endswith("feature_store.type=tq") for item in commands.consumer)
+    assert any(item.endswith("feature_store.type=ray_reference") for item in commands.consumer)
     assert not any("run_id=user-value" in item for item in commands.consumer)
     assert not any("runtime_backend" in item for item in commands.consumer_overrides)
     assert not any("num_gpus_per_node" in item for item in commands.consumer_overrides)
@@ -549,10 +635,11 @@ def test_pipeline_starts_owner_then_consumer_then_producer() -> None:
             Path(env["SPECO_TQ_OWNER_READY_FILE"]).touch()
         return process
 
-    config = resolve_pipeline_config(_training_args(), environ={})
+    args = [*_training_args(), "speco.draft_training.runtime_backend=subprocess"]
+    config = resolve_pipeline_config(args, environ={})
     commands = build_pipeline_commands(
         config,
-        _training_args(),
+        args,
         ray_address="127.0.0.1:61234",
     )
 
@@ -845,7 +932,7 @@ def test_ray_pipeline_validates_mooncake_master_before_spawning(
         raise OSError("connection refused")
 
     monkeypatch.setattr(launcher.socket, "create_connection", _connect)
-    commands = SimpleNamespace(vllm_endpoints=["http://ready:8000/v1"], vllm=None)
+    commands = SimpleNamespace(vllm_endpoints=["http://ready:8000/v1"], vllm=None, consumer_overrides=())
 
     with pytest.raises(RuntimeError, match="no mooncake_master is reachable"):
         ray_runtime.run_ray_pipeline(
@@ -877,6 +964,12 @@ def test_pipeline_commands_select_mooncake_hidden_states_store() -> None:
 
     assert commands.vllm is not None
     joined_vllm = " ".join(commands.vllm)
+    assert commands.owner == []
+    prefix = "actor_rollout_ref.rollout.drafter.training"
+    assert f"{prefix}.feature_store.type=ray_reference" in commands.consumer_overrides
+    assert f"{prefix}.transfer_queue.enable=false" in commands.consumer_overrides
+    assert f"{prefix}.target_feature_replay.hidden_states_store.backend=mooncake" in commands.consumer_overrides
+    assert f"{prefix}.target_feature_replay.hidden_states_store.mooncake.master_server_address=10.0.0.7:50051" in commands.consumer_overrides
     assert "SpecoMooncakeHiddenStatesConnector" in joined_vllm
     assert "verl_speco.mooncake_hidden_states_connector" in joined_vllm
     assert any(

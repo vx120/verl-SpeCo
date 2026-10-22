@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -25,6 +26,7 @@ PPO_EXAMPLES = [
     script
     for script in (ROOT / "examples").glob("*.sh")
     if not script.name.endswith("_separate_training.sh")
+    and "_eval" not in script.name
 ]
 
 
@@ -59,7 +61,13 @@ def _require_working_bash() -> str:
 @pytest.mark.parametrize("script", EXAMPLES, ids=lambda path: path.name)
 def test_example_shell_syntax_is_valid(script: Path) -> None:
     bash = _require_working_bash()
-    subprocess.run([bash, "-n", str(script)], check=True)
+    path = str(script)
+    if os.name == "nt":
+        if "system32" in bash.lower():
+            path = "/mnt/" + script.drive.rstrip(":").lower() + "/" + script.relative_to(script.anchor).as_posix()
+        else:
+            path = script.as_posix()
+    subprocess.run([bash, "-n", path], check=True)
 
 
 @pytest.mark.parametrize("script", PPO_EXAMPLES, ids=lambda path: path.name)
@@ -67,6 +75,12 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
     script: Path,
 ) -> None:
     source = script.read_text(encoding="utf-8")
+    if script.name == "run_qwen3-8b_v1_hard_freeze_longrun_drafter_dspark_vllm_npu.sh":
+        # This wrapper changes dimensions/policy, then reuses the complete
+        # launch so its entrypoint and drafter switches cannot drift.
+        launch = "run_qwen3-8b_v1_hard_freeze_smoke_drafter_dspark_vllm_npu.sh"
+        assert f'exec bash "${{script_dir}}/{launch}"' in source
+        source = (script.parent / launch).read_text(encoding="utf-8")
 
     assert (
         "python3 -m verl_speco.main" in source or "python -m verl_speco.main" in source
@@ -84,6 +98,33 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
     assert "actor_rollout_ref.rollout.drafter.training.publish_async=" in source
 
 
+def test_v1_hard_freeze_longrun_uses_full_dimensions_and_normal_policy() -> None:
+    source = (
+        ROOT / "examples" / "run_qwen3-8b_v1_hard_freeze_longrun_drafter_dspark_vllm_npu.sh"
+    ).read_text(encoding="utf-8")
+    for setting in (
+        "export SPECO_TRAIN_BATCH_SIZE=64",
+        "export SPECO_MAX_RESPONSE_LENGTH=8192",
+        "export SPECO_DRAFTER_COLLECT_INTERVAL=5",
+        "export SPECO_DRAFTER_TRAINING_INTERVAL=5",
+        '"${freeze}.gain.practical_gain_all=0.005"',
+        '"${freeze}.gain.practical_gain_hard=0.005"',
+        '"${freeze}.gain.window_updates=3"',
+        '"${freeze}.probe.interval_updates=3"',
+    ):
+        assert setting in source
+    assert '"$@"' in source
+
+
+def test_v1_hard_freeze_runner_selection_is_explicit_in_ray_environment() -> None:
+    source = (
+        ROOT / "examples" / "run_qwen3-8b_v1_hard_freeze_smoke_drafter_dspark_vllm_npu.sh"
+    ).read_text(encoding="utf-8")
+    # An existing Ray head does not inherit the launcher's shell exports.
+    for name in ("VLLM_USE_V1", "VLLM_USE_V2_MODEL_RUNNER"):
+        assert f"++ray_kwargs.ray_init.runtime_env.env_vars.{name}='\"1\"'" in source
+
+
 def test_standalone_tq_training_example_uses_unified_launcher() -> None:
     source = (
         ROOT / "examples" / "run_qwen3-8b_drafter_dspark_separate_training.sh"
@@ -99,6 +140,14 @@ def test_standalone_tq_training_example_uses_unified_launcher() -> None:
     assert "speco.standalone_tq_producer.per_endpoint_concurrency=" in source
     assert "actor_rollout_ref.rollout.drafter.training.dspark_ce_loss_alpha=" in source
     assert "actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=" in source
+    assert (
+        "actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha="
+        in source
+    )
+    assert (
+        "actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha="
+        in source
+    )
     assert "DSPARK_MAX_WINDOW=${DSPARK_MAX_WINDOW:-0}" in source
     assert "DSPARK_MAX_WINDOW=${DSPARK_MAX_WINDOW:-512}" not in source
     assert "training.dspark_max_window=${DSPARK_MAX_WINDOW}" in source
@@ -192,7 +241,12 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
     mrv2 = _launch_assignments(mrv2_source)
     added_keys = {
         "+actor_rollout_ref.rollout.engine_kwargs.vllm.no-async-scheduling",
+        "actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes",
+        "data.val_batch_size",
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.weight_nz_mode",
+        "+actor_rollout_ref.rollout.drafter.vllm.speculative_config_overrides.enable_adaptive_verification",
         "actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha",
+        "actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_with_markov",
     }
     baseline_only_keys = {
         "actor_rollout_ref.rollout.drafter.training.dspark_hard_candidate_ratio",
@@ -204,6 +258,7 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
         "data.filter_overlong_prompts",
         "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens",
         "actor_rollout_ref.rollout.drafter.training.publish_async",
+        "actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha",
         "actor_rollout_ref.rollout.drafter.training.collect_interval_steps",
         "actor_rollout_ref.rollout.drafter.training.training_interval_steps",
     }
@@ -246,12 +301,18 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
     assert "data.filter_overlong_prompts=False" in mrv2_source
     assert "data.filter_overlong_prompts=True" not in mrv2_source
     assert "data.filter_overlong_prompts_workers=256" in mrv2_source
-    assert "dspark_confidence_head_alpha=0.0" in mrv2_source
-    assert "dynamic_spec" not in mrv2_source
+    assert "dspark_confidence_head_alpha=1.0" in mrv2_source
+    assert "dspark_confidence_loss_alpha=1.0" in mrv2_source
+    assert "dspark_confidence_head_with_markov=True" in mrv2_source
+    assert "enable_adaptive_verification=True" in mrv2_source
+    assert "additional_config.weight_nz_mode=0" in mrv2_source
+    # The V1 dynamic-verify mechanism must not be *configured* on the MRV2 recipe
+    # (a header comment may still describe it as the V1 alternative).
+    assert not any("dynamic_spec" in key for key in mrv2)
     assert "SPECO MRV2 run directory" not in mrv2_source
     assert "tee -a" not in mrv2_source
-    assert "MODEL_PATH=/path/to/model" in mrv2_source
-    assert "CKPTS_DIR=/path/to/checkpoint" in mrv2_source
-    assert "TRAIN_FILE=/path/to/train_file" in mrv2_source
-    assert "TEST_FILE=/path/to/test_file" in mrv2_source
-    assert "DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter" in mrv2_source
+    assert "MODEL_PATH=${MODEL_PATH:-/path/to/model}" in mrv2_source
+    assert "CKPTS_DIR=${CKPTS_DIR:-/path/to/checkpoint}" in mrv2_source
+    assert "TRAIN_FILE=${TRAIN_FILE:-/path/to/train_file}" in mrv2_source
+    assert "TEST_FILE=${TEST_FILE:-/path/to/test_file}" in mrv2_source
+    assert "DRAFTER_PATH=${DRAFTER_PATH:-/path/to/vllm-compatible-dspark-drafter}" in mrv2_source
