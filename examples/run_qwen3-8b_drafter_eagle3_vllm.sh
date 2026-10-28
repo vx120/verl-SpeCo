@@ -1,5 +1,6 @@
 set -euo pipefail
 set -x
+export VLLM_USE_V2_MODEL_RUNNER=1
 
 # GPU example for the native EAGLE3 proposer in vLLM.
 project_name='verl_grpo_example_eagle3_drafter'

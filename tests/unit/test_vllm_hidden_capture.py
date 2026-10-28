@@ -78,11 +78,11 @@ class _FakePlan:
 
 
 def _install_fake_vllm(monkeypatch) -> None:
-    module = types.ModuleType("vllm.v1.hidden_state_capture")
+    module = types.ModuleType("vllm.distributed.aux_output_connector.hidden_states")
     module.HiddenStateCapturePlan = _FakePlan
     monkeypatch.setitem(sys.modules, "vllm", types.ModuleType("vllm"))
     monkeypatch.setitem(sys.modules, "vllm.v1", types.ModuleType("vllm.v1"))
-    monkeypatch.setitem(sys.modules, "vllm.v1.hidden_state_capture", module)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
     aux_module = types.ModuleType("vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils")
     aux_module.get_eagle3_aux_layers_from_config = lambda config: None
     monkeypatch.setitem(sys.modules, aux_module.__name__, aux_module)
@@ -137,22 +137,33 @@ def test_context_local_adapter_only_marks_the_active_request() -> None:
     install_vllm_hidden_capture_adapter(engine)
     context = SimpleNamespace(
         request_id="selected",
-        plan="plan",
+        plan=_FakePlan("selected", 4, 5, 9, "test", 4, (), "final"),
         result=None,
         skip_reason=None,
         output_token_ids=[],
     )
 
+    params = SimpleNamespace(extra_args={"existing": 7})
+
     async def run():
         with activate_vllm_hidden_capture(engine, context):
-            async for _ in engine.generate(request_id="selected"):
+            async for _ in engine.generate(
+                request_id="selected", sampling_params=params
+            ):
                 pass
-            async for _ in engine.generate(request_id="other"):
+            async for _ in engine.generate(request_id="other", sampling_params=params):
                 pass
 
     asyncio.run(run())
-    assert seen[0]["hidden_state_capture"] == "plan"
-    assert "hidden_state_capture" not in seen[1]
+    assert (
+        seen[0]["sampling_params"].extra_args["hidden_state_capture"][
+            "window_start_abs"
+        ]
+        == 5
+    )
+    assert seen[0]["sampling_params"].extra_args["existing"] == 7
+    assert seen[1]["sampling_params"].extra_args == {"existing": 7}
+    assert params.extra_args == {"existing": 7}
 
 
 def test_adapter_install_failure_skips_capture_without_breaking_rollout() -> None:
@@ -225,7 +236,7 @@ def test_real_runner_plan_and_training_sample_layouts(
     """Exercise the sibling Runner contract without importing the CUDA engine."""
     source = (
         Path(__file__).resolve().parents[3]
-        / "vllm-windowed-hidden-state-collection/vllm/v1/hidden_state_capture.py"
+        / "vllm/vllm/distributed/aux_output_connector/hidden_states.py"
     )
     if os.environ.get("SPECO_RUNNER_CAPTURE_SOURCE"):
         source = Path(os.environ["SPECO_RUNNER_CAPTURE_SOURCE"])
@@ -237,7 +248,7 @@ def test_real_runner_plan_and_training_sample_layouts(
     spec.loader.exec_module(module)
     _install_fake_vllm(monkeypatch)
     sys.modules[
-        "vllm.v1.hidden_state_capture"
+        "vllm.distributed.aux_output_connector.hidden_states"
     ].HiddenStateCapturePlan = module.HiddenStateCapturePlan
     config = _config(dspark_l1_loss_alpha=alpha)
     config["speculative_algorithm"] = algorithm

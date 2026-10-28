@@ -17,11 +17,12 @@
 from __future__ import annotations
 
 import contextvars
+import copy
 import hashlib
 import inspect
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from verl_speco.integration.oldlogprob_layer_ids import (
@@ -149,7 +150,17 @@ def install_vllm_hidden_capture_adapter(engine: Any) -> None:
         if request_id is None and len(args) >= 3:
             request_id = args[2]
         if active is not None and str(request_id) == active.request_id:
-            kwargs["hidden_state_capture"] = active.plan
+            args = list(args)
+            params = kwargs.get("sampling_params", args[1] if len(args) > 1 else None)
+            params = copy.copy(params)
+            params.extra_args = {
+                **(params.extra_args or {}),
+                "hidden_state_capture": asdict(active.plan),
+            }
+            if "sampling_params" in kwargs:
+                kwargs["sampling_params"] = params
+            else:
+                args[1] = params
         generator = original_generate(*args, **kwargs)
         if inspect.isawaitable(generator):
             generator = await generator
@@ -261,7 +272,9 @@ def build_vllm_hidden_capture_context(
         else "final"
     )
     try:
-        from vllm.v1.hidden_state_capture import HiddenStateCapturePlan
+        from vllm.distributed.aux_output_connector.hidden_states import (
+            HiddenStateCapturePlan,
+        )
 
         plan = HiddenStateCapturePlan.from_window(
             request_id=str(request_id),

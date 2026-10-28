@@ -2327,6 +2327,11 @@ def _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg: Any) -> None:
     )
     engine_kwargs_root = _ensure_child_mapping(rollout_cfg, "engine_kwargs")
     engine_kwargs = _ensure_child_mapping(engine_kwargs_root, "vllm")
+    if bool(
+        _get_nested(drafter_cfg, ("training", "collect_hidden_states_from_vllm"), False)
+    ):
+        aux_config = _ensure_child_mapping(engine_kwargs, "aux_output_config")
+        _set_child(aux_config, "enable_hidden_states", True)
     existing_spec = _get_nested(engine_kwargs, ("speculative_config",), None)
     merged_speculative_config = _merge_speculative_config(
         existing_spec, speculative_config
@@ -2671,6 +2676,11 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     engine_kwargs = _ensure_nested_mapping(
         config, ("actor_rollout_ref", "rollout", "engine_kwargs", "vllm")
     )
+    if bool(
+        _get_nested(drafter_cfg, ("training", "collect_hidden_states_from_vllm"), False)
+    ):
+        aux_config = _ensure_child_mapping(engine_kwargs, "aux_output_config")
+        _set_child(aux_config, "enable_hidden_states", True)
     existing_spec = _get_nested(engine_kwargs, ("speculative_config",), None)
     merged_speculative_config = _merge_speculative_config(
         existing_spec, speculative_config
@@ -4080,7 +4090,15 @@ class SpecoVLLMColocateWorkerExtension(
 
     def speco_hidden_capture_layer_ids(self) -> tuple[int, ...]:
         """Return the auxiliary layout selected by the loaded target model."""
-        return tuple(self.model_runner.hidden_state_capture_aux_layer_ids)
+        from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+            get_eagle3_aux_layers_from_config,
+        )
+
+        runner = self.model_runner
+        layers = get_eagle3_aux_layers_from_config(runner.speculative_config)
+        if not layers:
+            layers = runner.model.get_eagle3_default_aux_hidden_state_layers()
+        return tuple(sorted(set(layers)))
 
     def speco_ensure_draft_initialized(self) -> dict[str, Any]:
         """Load the base drafter once, before its first serving request."""
