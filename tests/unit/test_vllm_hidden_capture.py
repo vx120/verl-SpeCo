@@ -26,6 +26,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+
 from verl_speco.integration.vllm_hidden_capture import (
     _resolve_aux_layer_ids,
     activate_vllm_hidden_capture,
@@ -45,6 +46,7 @@ class _FakePlan:
     min_rows: int
     aux_layer_ids: tuple[int, ...]
     hidden_layout: str
+    logprob_topk: int = 0
 
     @classmethod
     def from_window(
@@ -59,6 +61,7 @@ class _FakePlan:
         min_rows,
         aux_layer_ids,
         hidden_layout,
+        logprob_topk=0,
     ):
         offset = prompt_len - 1 if coordinate == "response" else 0
         return cls(
@@ -70,6 +73,7 @@ class _FakePlan:
             min_rows,
             aux_layer_ids,
             hidden_layout,
+            logprob_topk,
         )
 
 
@@ -307,3 +311,68 @@ def test_result_becomes_position_aware_drafter_sample(monkeypatch) -> None:
     assert sample["hidden_positions"].tolist() == [[4, 5]]
     assert sample["input_ids"].tolist() == [[10, 11, 12, 20, 21, 22]]
     assert sample["replica_rank"] == 2
+
+
+def test_use_logits_requests_window_topk(monkeypatch):
+    _install_fake_vllm(monkeypatch)
+    context, reason = build_vllm_hidden_capture_context(
+        engine=_engine((1, 2, 3)),
+        drafter_config=_config(use_logits=True, logits_topk=16),
+        prompt_ids=[10, 20, 30],
+        sampling_params={"max_tokens": 8},
+        request_id="topk",
+        global_step=1,
+        replica_rank=0,
+    )
+    assert reason is None
+    assert context.plan.logprob_topk == 16
+
+
+def test_window_topk_supervision_keeps_predictor_positions():
+    from verl_speco.integration.vllm_hidden_capture import VLLMHiddenCaptureContext
+
+    plan = _FakePlan.from_window(
+        "req",
+        4,
+        0,
+        4,
+        "test",
+        coordinate="response",
+        min_rows=1,
+        aux_layer_ids=(),
+        hidden_layout="final",
+        logprob_topk=2,
+    )
+    logits = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    values, ids = logits.log_softmax(-1).topk(2, dim=-1)
+    result = SimpleNamespace(
+        hidden_positions=np.arange(3, 7),
+        hidden_states=torch.ones(4, 2),
+        hidden_window_start=3,
+        hidden_window_end=7,
+        collection_id="test",
+        logprobs=values,
+        logprob_token_ids=ids,
+    )
+    context = VLLMHiddenCaptureContext(
+        request_id="req",
+        plan=plan,
+        prompt_ids=[1, 2, 3, 4],
+        global_step=1,
+        replica_rank=0,
+        window_mode="front",
+        result=result,
+    )
+    sample = vllm_capture_to_drafter_sample(context, [5, 6, 7, 8])
+    values, ids = logits.log_softmax(-1).topk(2, dim=-1)
+    assert sample["target_logprobs"].shape == (1, 4, 2, 2)
+    torch.testing.assert_close(sample["target_logprobs"][0, ..., 0], values)
+    assert torch.equal(sample["target_logprobs"][0, ..., 1].long(), ids)
+    assert sample["target_logprobs_position_start"] == 3
+    assert sample["target_logprobs_position_end"] == 7
+    assert sample["hidden_raw_target_logprobs_positions"].tolist() == [[4, 5, 6, 7]]
+    torch.testing.assert_close(
+        sample["hidden_raw_target_logprobs"], sample["target_logprobs"]
+    )
+    context.result.logprobs = None
+    assert vllm_capture_to_drafter_sample(context, [5, 6, 7, 8]) is None

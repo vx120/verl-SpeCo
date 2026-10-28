@@ -2382,6 +2382,20 @@ def _apply_vllm_boolean_launch_overrides(args: Any, config: Any) -> None:
 class _SpecoVLLMHttpServerMixin:
     async def set_speco_capture_step(self, global_step: int) -> None:
         self._speco_capture_global_step = int(global_step)
+        if global_step <= 0 or not getattr(
+            self, "_speco_vllm_hidden_capture_enabled", False
+        ):
+            return
+        engine = cast(Any, self).engine
+        if hasattr(engine, "_speco_hidden_capture_aux_layer_ids"):
+            return
+        layers = await engine.collective_rpc("speco_hidden_capture_layer_ids")
+        if not layers or any(tuple(value) != tuple(layers[0]) for value in layers):
+            raise RuntimeError(
+                "vLLM workers disagree on hidden capture auxiliary layers"
+            )
+        engine._speco_hidden_capture_aux_layer_ids = tuple(layers[0])
+        logger.info("[speco capture] actual worker auxiliary layers=%s", layers[0])
 
     def _speco_pop_vllm_spec_decode_stats(self) -> dict[str, float]:
         stats = getattr(self, "_speco_vllm_spec_decode_pending_stats", None)
@@ -4063,6 +4077,10 @@ class SpecoVLLMColocateWorkerExtension(
 
         self._speco_draft_weight_source = "checkpoint"
         return loaded_count
+
+    def speco_hidden_capture_layer_ids(self) -> tuple[int, ...]:
+        """Return the auxiliary layout selected by the loaded target model."""
+        return tuple(self.model_runner.hidden_state_capture_aux_layer_ids)
 
     def speco_ensure_draft_initialized(self) -> dict[str, Any]:
         """Load the base drafter once, before its first serving request."""

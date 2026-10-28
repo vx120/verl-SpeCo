@@ -75,6 +75,9 @@ def _sampling_max_tokens(sampling_params: Any) -> int | None:
 
 
 def _resolve_aux_layer_ids(engine: Any, *, get_aux_layers=None) -> tuple[int, ...]:
+    cached = _get(engine, "_speco_hidden_capture_aux_layer_ids", None)
+    if cached is not None:
+        return _as_int_list(cached)
     config = _get(engine, "vllm_config", None)
     speculative = _get(config, "speculative_config", None)
     if get_aux_layers is None:
@@ -272,6 +275,11 @@ def build_vllm_hidden_capture_context(
             hidden_layout=(
                 "aux_final" if hidden_layout.endswith("_plus_last") else hidden_layout
             ),
+            **(
+                {"logprob_topk": int(_get(training, "logits_topk", 128))}
+                if bool(_get(training, "use_logits", False))
+                else {}
+            ),
         )
     except (AttributeError, ImportError, TypeError, ValueError) as exc:
         return None, f"plan_unavailable:{type(exc).__name__}"
@@ -309,7 +317,7 @@ def vllm_capture_to_drafter_sample(
     response_ids = list(token_ids or context.output_token_ids)
     prompt = torch.tensor(context.prompt_ids, dtype=torch.long)
     response = torch.tensor(response_ids, dtype=torch.long)
-    return {
+    sample = {
         "input_ids": torch.cat([prompt, response]).unsqueeze(0),
         "prompts": prompt.unsqueeze(0),
         "responses": response.unsqueeze(0),
@@ -326,6 +334,34 @@ def vllm_capture_to_drafter_sample(
         "replica_rank": context.replica_rank,
         "collection_id": str(result.collection_id),
     }
+    if int(getattr(context.plan, "logprob_topk", 0)):
+        values = getattr(result, "logprobs", None)
+        indices = getattr(result, "logprob_token_ids", None)
+        expected_shape = (len(positions), context.plan.logprob_topk)
+        if values is None or indices is None:
+            return None
+        if (
+            tuple(values.shape) != expected_shape
+            or tuple(indices.shape) != expected_shape
+        ):
+            return None
+        sample.update(
+            target_logprobs=torch.stack(
+                (values.float(), indices.float()), dim=-1
+            ).unsqueeze(0),
+            target_logprobs_position_start=int(positions[0]),
+            target_logprobs_position_end=int(positions[-1]) + 1,
+            hidden_target_logprobs_source="vllm_raw_logprobs",
+            hidden_raw_target_logprobs=torch.stack(
+                (values.float(), indices.float()), dim=-1
+            ).unsqueeze(0),
+            hidden_raw_target_logprobs_positions=torch.from_numpy(
+                positions.copy() + 1
+            ).unsqueeze(0),
+            hidden_raw_target_logprobs_position_start=int(positions[0]) + 1,
+            hidden_raw_target_logprobs_position_end=int(positions[-1]) + 2,
+        )
+    return sample
 
 
 def vllm_capture_metrics(

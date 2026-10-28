@@ -41,7 +41,9 @@ def test_v080_npu_patch_temporarily_adds_factory_weight_loader(monkeypatch) -> N
         if module_name == compat._VLLM_FUSED_MOE_MODULE:
             return fused_moe_module
         if module_name == compat._VERL_NPU_VLLM_PATCH_MODULE:
-            assert fused_moe_factory.weight_loader is compat._unused_factory_weight_loader
+            assert (
+                fused_moe_factory.weight_loader is compat._unused_factory_weight_loader
+            )
             return types.ModuleType(module_name)
         raise AssertionError(f"unexpected import: {module_name}")
 
@@ -410,3 +412,29 @@ def test_fsdp_training_output_release_preserves_forward_only(monkeypatch) -> Non
     _, inference_output = engine.forward_step(None, None, True)
     assert "model_output" not in training_output
     assert inference_output["model_output"] == {"log_probs": "tensor"}
+
+
+def test_torch_padding_without_flash_attn_preserves_values_and_gradients(monkeypatch):
+    import torch
+    from verl.utils import attention_utils
+
+    monkeypatch.setattr(compat, "_module_available", lambda name: False)
+    original = attention_utils._get_attention_functions
+    try:
+        assert compat.install_verl_torch_padding_compat()
+        values = torch.arange(12, dtype=torch.float32).reshape(2, 3, 2).requires_grad_()
+        mask = torch.tensor([[0, 1, 1], [1, 0, 0]], dtype=torch.int32)
+        packed, indices, cumulative, max_len, *_ = attention_utils.unpad_input(
+            values, mask
+        )
+        torch.testing.assert_close(packed, values.detach()[mask.bool()])
+        assert cumulative.tolist() == [0, 2, 3]
+        assert max_len == 2
+        padded = attention_utils.pad_input(packed, indices, 2, 3)
+        torch.testing.assert_close(padded, values.detach() * mask.unsqueeze(-1))
+        packed.sum().backward()
+        torch.testing.assert_close(
+            values.grad, mask.unsqueeze(-1).expand_as(values).float()
+        )
+    finally:
+        attention_utils._get_attention_functions = original

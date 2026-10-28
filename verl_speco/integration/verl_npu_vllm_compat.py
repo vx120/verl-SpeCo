@@ -489,6 +489,24 @@ def _is_npu_worker() -> bool:
         return False
 
 
+def install_verl_torch_padding_compat() -> bool:
+    """Use upstream device-agnostic padding helpers when FlashAttention is absent."""
+    if _module_available("flash_attn"):
+        return False
+    from verl.utils import attention_utils, npu_flash_attn_utils
+
+    def torch_padding_functions():
+        return (
+            npu_flash_attn_utils.index_first_axis,
+            npu_flash_attn_utils.pad_input,
+            npu_flash_attn_utils.rearrange,
+            npu_flash_attn_utils.unpad_input,
+        )
+
+    attention_utils._get_attention_functions = torch_padding_functions
+    return True
+
+
 class VerlNPUVLLMImportCompatMixin:
     """Install import compatibility when WorkerDict constructs the worker."""
 
@@ -496,6 +514,7 @@ class VerlNPUVLLMImportCompatMixin:
         from verl_speco.integration.compat import check_compatible_verl
 
         check_compatible_verl()
+        install_verl_torch_padding_compat()
         install_verl_vllm_fp8_import_compat()
         install_verl_npu_vllm_import_compat()
         install_verl_fsdp_training_output_release_compat()

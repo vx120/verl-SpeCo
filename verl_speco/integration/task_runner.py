@@ -198,6 +198,11 @@ class SpecoTaskRunner(_TaskRunnerBase):
         return self._run_with_speco_trainer(config)
 
     def _run_with_speco_trainer(self, config):
+        from verl_speco.integration.verl_npu_vllm_compat import (
+            install_verl_torch_padding_compat,
+        )
+
+        install_verl_torch_padding_compat()
         from verl.utils.dataset.rl_dataset import collate_fn
 
         from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer
