@@ -2317,6 +2317,19 @@ def _build_speco_vllm_stat_logger(server: Any):
     return SpecoVLLMSpecDecodeStatLogger
 
 
+def _configure_vllm_hidden_capture(engine_kwargs: Any, drafter_cfg: Any) -> None:
+    training = _get_nested(drafter_cfg, ("training",), {})
+    if not bool(_get_nested(training, ("collect_hidden_states_from_vllm",), False)):
+        return
+    aux_config = _ensure_child_mapping(engine_kwargs, "aux_output_config")
+    _set_child(aux_config, "enable_hidden_states", True)
+    if bool(_get_nested(training, ("use_logits",), False)) and _get_nested(
+        engine_kwargs, ("max_logprobs",), None
+    ) is None:
+        topk = int(_get_nested(training, ("logits_topk",), 128))
+        _set_child(engine_kwargs, "max_logprobs", topk)
+
+
 def _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg: Any) -> None:
     drafter_cfg = _load_env_drafter_config()
     if not bool(drafter_cfg.get("enable")):
@@ -2327,11 +2340,7 @@ def _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg: Any) -> None:
     )
     engine_kwargs_root = _ensure_child_mapping(rollout_cfg, "engine_kwargs")
     engine_kwargs = _ensure_child_mapping(engine_kwargs_root, "vllm")
-    if bool(
-        _get_nested(drafter_cfg, ("training", "collect_hidden_states_from_vllm"), False)
-    ):
-        aux_config = _ensure_child_mapping(engine_kwargs, "aux_output_config")
-        _set_child(aux_config, "enable_hidden_states", True)
+    _configure_vllm_hidden_capture(engine_kwargs, drafter_cfg)
     existing_spec = _get_nested(engine_kwargs, ("speculative_config",), None)
     merged_speculative_config = _merge_speculative_config(
         existing_spec, speculative_config
@@ -2676,11 +2685,7 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     engine_kwargs = _ensure_nested_mapping(
         config, ("actor_rollout_ref", "rollout", "engine_kwargs", "vllm")
     )
-    if bool(
-        _get_nested(drafter_cfg, ("training", "collect_hidden_states_from_vllm"), False)
-    ):
-        aux_config = _ensure_child_mapping(engine_kwargs, "aux_output_config")
-        _set_child(aux_config, "enable_hidden_states", True)
+    _configure_vllm_hidden_capture(engine_kwargs, drafter_cfg)
     existing_spec = _get_nested(engine_kwargs, ("speculative_config",), None)
     merged_speculative_config = _merge_speculative_config(
         existing_spec, speculative_config

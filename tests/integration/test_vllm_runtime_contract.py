@@ -1446,3 +1446,32 @@ def test_vllm_draft_loader_rejects_partial_online_update() -> None:
             {"layers.0.self_attn.qkv_proj.weight"},
             draft_method="dspark",
         )
+
+
+@pytest.mark.parametrize("topk,limit", [(64, None), (128, None), (128, 256), (128, -1)])
+def test_hidden_capture_sets_engine_logprob_limit(monkeypatch, topk, limit):
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
+        lambda: True,
+    )
+    config = {
+        "actor_rollout_ref": {
+            "rollout": {
+                "name": "vllm",
+                "drafter": _drafter(
+                    training={
+                        "collect_hidden_states_from_vllm": True,
+                        "use_logits": True,
+                        "logits_topk": topk,
+                    }
+                ),
+                "engine_kwargs": {"vllm": {}},
+            }
+        }
+    }
+    if limit is not None:
+        config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]["max_logprobs"] = limit
+    configure_vllm_runtime_from_config(config)
+    kwargs = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]
+    assert kwargs["aux_output_config"]["enable_hidden_states"]
+    assert kwargs["max_logprobs"] == (topk if limit is None else limit)

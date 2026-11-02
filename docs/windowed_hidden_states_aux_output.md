@@ -1,12 +1,12 @@
 # vLLM AuxOutput window capture
 
-Last updated: 10/28/2026
+Last updated: 11/02/2026
 
 The vLLM integration uses the AuxOutput Connector on CUDA Model Runner V2.
 SpeCo keeps the existing window planner, training sample layout and hidden transport.
 Only the engine request/result adapter changes: the request window is placed in
 `SamplingParams.extra_args.hidden_state_capture`, and the result is consumed from
-`RequestOutput.hidden_state_capture`.
+`RequestOutput.aux_outputs.hidden_state_capture`.
 
 Enable this source and disable the other collection sources:
 
@@ -30,7 +30,12 @@ actor_rollout_ref:
 ```
 
 SpeCo automatically enables `aux_output_config.enable_hidden_states` in the engine
-configuration. Set `VLLM_USE_V2_MODEL_RUNNER=1` before starting the job. When passing
+configuration. When `training.use_logits` is enabled, it also defaults the engine's
+`max_logprobs` to `training.logits_topk` (128 when omitted), so capture requests
+fit the engine admission limit. An explicit `engine_kwargs.vllm.max_logprobs`
+is preserved and must permit the requested top-k (`-1` means unlimited).
+
+Set `VLLM_USE_V2_MODEL_RUNNER=1` before starting the job. When passing
 fixed `start` and `end` fields through Hydra, use `+` if they are not present in the
 base YAML, for example:
 
@@ -55,3 +60,12 @@ The previous Runner integration and its historical deployment measurements are
 documented in `windowed_hidden_states_runner.md`. They are not performance results
 for the AuxOutput implementation. Measure the deployed version using the vLLM
 window benchmark before comparing throughput.
+
+## Short training check
+
+For the local Qwen3/EAGLE3 setup, run `bash examples/run_windowed_hidden_capture_smoke.sh`.
+It limits the run to three global steps, collects/trains/publishes every two steps,
+disables evaluation and checkpoint saving, and sets `rollout.max_num_seqs=4`.
+The concurrency cap matters: capture admission reserves bytes for the configured
+maximum sequence count, not just the current batch. A default of 1024 can exceed
+the 256 MiB capture budget even when the actual rollout batch has four requests.
