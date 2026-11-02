@@ -528,14 +528,16 @@ class VerlNPUVLLMImportCompatMixin:
         # WorkerDict process. Install immediately before the upstream sender is
         # constructed so no-drafter runs receive the same NPU SHM protection.
         _install_weight_transfer_shm_reuse()
+        upstream_update = cast(Any, super()).update_weights
+        kwargs: dict[str, Any] = {"global_steps": global_steps}
+        if "mode" in inspect.signature(upstream_update).parameters:
+            kwargs["mode"] = mode
+        elif mode != "auto":
+            raise ValueError("This verl worker supports mode='auto' only")
         if not _is_npu_worker():
-            return await cast(Any, super()).update_weights(
-                global_steps=global_steps, mode=mode
-            )
+            return await upstream_update(**kwargs)
 
         try:
-            return await cast(Any, super()).update_weights(
-                global_steps=global_steps, mode=mode
-            )
+            return await upstream_update(**kwargs)
         finally:
             trim_process_host_memory()

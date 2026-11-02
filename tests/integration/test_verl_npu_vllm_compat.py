@@ -438,3 +438,24 @@ def test_torch_padding_without_flash_attn_preserves_values_and_gradients(monkeyp
         )
     finally:
         attention_utils._get_attention_functions = original
+
+
+def test_worker_mixin_supports_legacy_weight_update_signature(monkeypatch):
+    monkeypatch.setattr(compat, "_install_weight_transfer_shm_reuse", lambda: True)
+    monkeypatch.setattr(compat, "_is_npu_worker", lambda: False)
+    calls = []
+
+    class BaseWorker:
+        async def update_weights(self, global_steps=None):
+            calls.append(global_steps)
+            return "updated"
+
+    class WrappedWorker(compat.VerlNPUVLLMImportCompatMixin, BaseWorker):
+        pass
+
+    worker = WrappedWorker.__new__(WrappedWorker)
+    assert asyncio.run(worker.update_weights(global_steps=2)) == "updated"
+    assert calls == [2]
+    with pytest.raises(ValueError, match="mode='auto'"):
+        asyncio.run(worker.update_weights(mode="naive"))
+    assert calls == [2]
