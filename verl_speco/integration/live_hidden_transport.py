@@ -119,3 +119,94 @@ def release_collection(payload):
 
         bridge.clear_samples(keys)
         logger.info("[live TQ release] count=%s keys=%s", len(keys), keys)
+
+
+def put_tensor_chunks(sample, training, *, chunk_rows=256):
+    """Publish row-aligned tensors; return metadata and ordered store references."""
+    cfg = training.get("transfer_queue", {})
+    if not cfg.get("enable", False):
+        return sample
+    from verl_speco.integration import transferqueue_bridge as bridge
+
+    if not bridge.configure_transfer_queue(training):
+        raise RuntimeError("Requested tensor transport is unavailable")
+    if chunk_rows < 1:
+        raise ValueError("chunk_rows must be positive")
+    run_id = cfg.get("run_id")
+    if not run_id:
+        raise ValueError("Tensor transport requires a unique run_id")
+    tensors = sample["tensors"]
+    rows = next(iter(tensors.values())).shape[0]
+    if rows < 1 or any(t.shape[0] != rows for t in tensors.values()):
+        raise ValueError("Payload tensors must have the same nonempty row dimension")
+    prefix = f"{run_id}:tensors:{sample['global_step']}:{sample['replica_rank']}:{sample['collection_id']}"
+    references, attempted_keys = [], []
+    try:
+        for start in range(0, rows, chunk_rows):
+            end = min(start + chunk_rows, rows)
+            key = f"{prefix}:{start}"
+            fields = {
+                name: tensor[start:end].detach().cpu().contiguous()
+                for name, tensor in tensors.items()
+            }
+            metadata = {
+                name: {
+                    "shape": list(t.shape),
+                    "dtype": str(t.dtype),
+                    "sha256": fingerprint(t),
+                }
+                for name, t in fields.items()
+            }
+            attempted_keys.append(key)
+            bridge.put_sample(key, fields, tag={"start": start, "end": end})
+            references.append(
+                {"key": key, "start": start, "end": end, "tensors": metadata}
+            )
+    except Exception:
+        bridge.clear_samples(attempted_keys)
+        raise
+    result = {name: value for name, value in sample.items() if name != "tensors"}
+    result.update(tensor_rows=rows, tensor_chunks=references)
+    return result
+
+
+def iter_tensor_chunks(sample, training):
+    """Read one chunk at a time without consuming references needed by other readers."""
+    if "tensor_chunks" not in sample:
+        yield sample["tensors"]
+        return
+    from verl_speco.integration import transferqueue_bridge as bridge
+
+    if not bridge.configure_transfer_queue(training):
+        raise RuntimeError(
+            "Tensor references require active TransferQueue configuration"
+        )
+    cursor = 0
+    for ref in sample["tensor_chunks"]:
+        if ref["start"] != cursor or ref["end"] <= cursor:
+            raise ValueError("Tensor chunk row ranges are not contiguous")
+        fields = bridge.get_samples([ref["key"]])[0][1]
+        if set(fields) != set(ref["tensors"]):
+            raise ValueError("Tensor chunk fields do not match the manifest")
+        for name, tensor in fields.items():
+            expected = ref["tensors"][name]
+            if (
+                list(tensor.shape) != expected["shape"]
+                or tensor.shape[0] != ref["end"] - ref["start"]
+                or str(tensor.dtype) != expected["dtype"]
+                or fingerprint(tensor) != expected["sha256"]
+            ):
+                raise ValueError(f"Tensor chunk integrity mismatch: {name}")
+        cursor = ref["end"]
+        yield fields
+    if cursor != sample["tensor_rows"]:
+        raise ValueError("Tensor chunk manifest is incomplete")
+
+
+def release_tensor_chunks(sample):
+    """Owner cleanup after all consumers have finished, including failed consumption."""
+    keys = [ref["key"] for ref in sample.get("tensor_chunks", [])]
+    if keys:
+        from verl_speco.integration import transferqueue_bridge as bridge
+
+        bridge.clear_samples(keys)

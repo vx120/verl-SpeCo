@@ -39,6 +39,58 @@ async def score_teacher_hidden(
     raise RuntimeError("Teacher stream ended without a final output")
 
 
+async def score_teacher_payload(
+    engine: Any,
+    prompt_ids: list[int],
+    response_ids: list[int],
+    request_id: str,
+    *,
+    teacher_model: str,
+    transport_config: dict | None = None,
+    global_step: int = 0,
+    replica_rank: int = 0,
+    chunk_rows: int = 256,
+) -> dict:
+    """Score supplied tokens and deliver aligned hidden rows plus a logits contract.
+
+    The caller owns the TransferQueue lifetime and releases the returned chunk
+    references only after all readers finish. No optimizer or training is run.
+    """
+    from dataclasses import asdict
+
+    from verl_speco.integration.live_hidden_transport import put_tensor_chunks
+
+    if not response_ids:
+        raise ValueError("response_ids must not be empty")
+    result = await score_teacher_hidden(engine, prompt_ids, response_ids, request_id)
+    positions = torch.from_numpy(result.hidden_positions.copy())
+    start = len(prompt_ids) - 1
+    if not torch.equal(positions, torch.arange(start, start + len(response_ids))):
+        raise ValueError("Teacher hidden positions do not align with response tokens")
+    if result.logits_contract is None:
+        raise ValueError("Teacher did not provide a logits reconstruction contract")
+    payload = {
+        "schema_version": 1,
+        "request_id": request_id,
+        "collection_id": request_id,
+        "teacher_model": teacher_model,
+        "hidden_layout": result.hidden_layout,
+        "includes_final_layer": result.includes_final_layer,
+        "layer_ids": list(result.layer_ids),
+        "prompt_token_ids": list(prompt_ids),
+        "global_step": global_step,
+        "replica_rank": replica_rank,
+        "segments": [asdict(segment) for segment in result.segments],
+        "logits_contract": dict(result.logits_contract),
+        "tensors": {
+            **result.tensors,
+            "hidden_positions": positions,
+            "response_token_ids": torch.tensor(response_ids, dtype=torch.long),
+        },
+    }
+    return put_tensor_chunks(payload, transport_config or {}, chunk_rows=chunk_rows)
+
+
 def reverse_kl_from_hidden(
     student_hidden: torch.Tensor,
     teacher_hidden: torch.Tensor,

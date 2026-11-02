@@ -13,9 +13,9 @@
 # limitations under the License.
 
 import importlib.util
-from pathlib import Path
 import sys
 import types
+from pathlib import Path
 
 import pytest
 import torch
@@ -107,4 +107,83 @@ def test_disabled_preserves_existing_sample(transport):
     original = sample()
     assert module.put_hidden(original, {}) is original
     assert module.get_hidden(original, {}) is original["hidden_states"]
+    assert not stored
+
+
+def tensor_sample():
+    return {
+        "global_step": 2,
+        "replica_rank": 0,
+        "collection_id": "teacher",
+        "logits_contract": {"vocab_size": 100},
+        "tensors": {
+            "hidden_states": torch.arange(28).reshape(7, 4).to(torch.bfloat16),
+            "hidden_positions": torch.arange(3, 10),
+            "response_token_ids": torch.arange(50, 57),
+        },
+    }
+
+
+def test_tensor_chunks_preserve_all_fields_for_multiple_readers(transport):
+    module, stored, cleared, _ = transport
+    original = tensor_sample()
+    ref = module.put_tensor_chunks(original, config(), chunk_rows=3)
+    assert "tensors" not in ref
+    assert ref["logits_contract"] == original["logits_contract"]
+    assert [(r["start"], r["end"]) for r in ref["tensor_chunks"]] == [
+        (0, 3),
+        (3, 6),
+        (6, 7),
+    ]
+    assert len(stored) == 3
+    for _ in range(2):
+        chunks = list(module.iter_tensor_chunks(ref, config()))
+        for name, expected in original["tensors"].items():
+            assert torch.equal(torch.cat([chunk[name] for chunk in chunks]), expected)
+        assert not cleared
+    module.release_tensor_chunks(ref)
+    assert not stored and len(cleared) == 3
+
+
+def test_partial_tensor_publication_releases_attempted_chunks(transport):
+    module, stored, _, bridge = transport
+
+    def fail_second(key, fields, tag):
+        stored[key] = fields
+        if len(stored) == 2:
+            raise RuntimeError("publication failed")
+
+    bridge.put_sample = fail_second
+    with pytest.raises(RuntimeError, match="publication failed"):
+        module.put_tensor_chunks(tensor_sample(), config(), chunk_rows=3)
+    assert not stored
+
+
+def test_tensor_chunk_corruption_fails_before_delivery(transport):
+    module, stored, _, _ = transport
+    ref = module.put_tensor_chunks(tensor_sample(), config(), chunk_rows=3)
+    stored[ref["tensor_chunks"][0]["key"]]["response_token_ids"][0] += 1
+    try:
+        with pytest.raises(ValueError, match="integrity"):
+            list(module.iter_tensor_chunks(ref, config()))
+    finally:
+        module.release_tensor_chunks(ref)
+    assert not stored
+
+
+def test_incomplete_tensor_manifest_is_rejected(transport):
+    module, stored, _, _ = transport
+    ref = module.put_tensor_chunks(tensor_sample(), config(), chunk_rows=3)
+    incomplete = {**ref, "tensor_chunks": ref["tensor_chunks"][:-1]}
+    with pytest.raises(ValueError, match="incomplete"):
+        list(module.iter_tensor_chunks(incomplete, config()))
+    module.release_tensor_chunks(ref)
+    assert not stored
+
+
+def test_tensor_chunks_disabled_keep_inline_payload(transport):
+    module, stored, _, _ = transport
+    sample = tensor_sample()
+    assert module.put_tensor_chunks(sample, {}) is sample
+    assert next(module.iter_tensor_chunks(sample, {})) is sample["tensors"]
     assert not stored

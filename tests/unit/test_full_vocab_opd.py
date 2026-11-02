@@ -29,3 +29,49 @@ def test_chunked_reverse_kl_matches_dense_loss_and_gradients(cap):
         torch.testing.assert_close(a, b)
     loss.backward()
     assert teacher.grad is None and teacher_weight.grad is None
+
+
+@pytest.mark.asyncio
+async def test_teacher_payload_aligns_response_tokens_and_contract(monkeypatch):
+    from dataclasses import dataclass
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from verl_speco.integration import full_vocab_opd as opd
+
+    @dataclass
+    class Segment:
+        kind: str = "prompt"
+        start_abs: int = 2
+        end_abs: int = 4
+
+    result = SimpleNamespace(
+        hidden_positions=np.array([2, 3]),
+        tensors={"hidden_states": torch.ones(2, 4, dtype=torch.bfloat16)},
+        logits_contract={"vocab_size": 100, "logit_scale": 1.0, "soft_cap": None},
+        segments=(Segment(),),
+        hidden_layout="final",
+        includes_final_layer=True,
+        layer_ids=(),
+    )
+
+    async def score(engine, prompt, response, request_id):
+        assert prompt == [10, 11, 12] and response == [13, 14]
+        return result
+
+    monkeypatch.setattr(opd, "score_teacher_hidden", score)
+    payload = await opd.score_teacher_payload(
+        None, [10, 11, 12], [13, 14], "r", teacher_model="teacher-v1"
+    )
+    assert payload["teacher_model"] == "teacher-v1"
+    assert payload["prompt_token_ids"] == [10, 11, 12]
+    assert payload["tensors"]["response_token_ids"].tolist() == [13, 14]
+    assert payload["tensors"]["hidden_positions"].tolist() == [2, 3]
+    assert payload["logits_contract"] == result.logits_contract
+    assert payload["segments"] == [{"kind": "prompt", "start_abs": 2, "end_abs": 4}]
+    result.hidden_positions[1] = 8
+    with pytest.raises(ValueError, match="align"):
+        await opd.score_teacher_payload(
+            None, [10, 11, 12], [13, 14], "r", teacher_model="teacher-v1"
+        )

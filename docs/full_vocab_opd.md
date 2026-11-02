@@ -24,3 +24,74 @@ Hidden delivery still uses the existing IPC payload and capture admission budget
 Keep sequences and concurrency small until streaming store delivery is available.
 These functions do not change the existing top-k OPD training configuration or
 launch a training job automatically.
+
+## Teacher data delivery without training
+
+`score_teacher_payload` scores supplied `prompt_ids + response_ids` and returns
+row-aligned data. It does not sample a student response, run a loss, or update
+parameters. The capture uses absolute positions
+`[len(prompt_ids)-1, len(prompt_ids)+len(response_ids)-1)`.
+
+The payload carries `teacher_model` (the checkpoint identifier supplied by the
+caller), prompt token IDs, segments, hidden layout/layer metadata and the vLLM
+`logits_contract`. Its `tensors` contain the captured hidden states, absolute
+`hidden_positions` and the corresponding `response_token_ids`. Consumers can
+load the matching teacher output head from that checkpoint; output-head weights
+and full-vocabulary logits are not transferred for every request.
+
+Without TransferQueue, these tensors remain inline. With the existing SpeCo
+TransferQueue configuration enabled, tensors are published in row chunks and
+replaced by `tensor_chunks` references. Each reference records a key, row range,
+field shapes/dtypes and checksums. Metadata stays small and JSON-serializable.
+The same interface works with TQ SimpleStorage and MooncakeStore. This reuses
+`live_hidden_transport` and `transferqueue_bridge`; it does not change vLLM.
+
+```python
+from verl_speco.integration.full_vocab_opd import score_teacher_payload
+from verl_speco.integration.live_hidden_transport import (
+    iter_tensor_chunks, release_tensor_chunks,
+)
+
+# config is the existing SpeCo transport configuration containing transfer_queue.
+# Start its task-level TQ owner before scoring; keep it alive through all readers.
+payload = await score_teacher_payload(
+    teacher_engine, prompt_ids, response_ids, request_id,
+    teacher_model="/data/model/Qwen3-1.7B",
+    transport_config=config, chunk_rows=256,
+)
+try:
+    for tensors in iter_tensor_chunks(payload, config):
+        consume(tensors, payload["logits_contract"], payload["teacher_model"])
+finally:
+    # The owner does this only after ALL consumers finish or fail.
+    release_tensor_chunks(payload)
+```
+
+Use a unique `transfer_queue.run_id`; use a teacher-specific `partition_id`, such
+as `speco_teacher_features`. Each process uses one transfer configuration. The
+owner starts the shared controller; consumers attach and close their local
+clients. A reader does not delete chunks. Publication failure clears attempted
+chunks, and the owner cleans up after consumer errors/cancellation. Do not stop
+the owner/master while readers are active. Mooncake still requires its usual
+shared service/network configuration across hosts.
+
+**Boundary:** this is chunked delivery from verl-SpeCo after vLLM returns the
+capture. The consumer can process chunks without concatenating the full result,
+but vLLM still buffers the capture internally and sends it across its existing
+IPC path. This does not remove `max_hidden_capture_bytes`, IPC limits, or vLLM's
+whole-window residency. Publishing directly from intermediate prefill chunks
+would require a vLLM connector/store change and is outside this implementation.
+
+A small check is provided in `examples/check_teacher_payload_delivery.py`.
+It scores eight teacher rows, writes three chunks and verifies two separate
+reader processes before releasing the references. It runs zero training steps:
+
+```bash
+PYTHONPATH=$PWD VLLM_USE_V2_MODEL_RUNNER=1 OMP_NUM_THREADS=2 \
+  /data/logprob-validation/.venv/bin/python examples/check_teacher_payload_delivery.py \
+  --backend MooncakeStore --model /data/model/Qwen3-1.7B --output /data/teacher-delivery.json
+```
+
+Add `--synthetic` for a CPU-only store check, or use `--backend SimpleStorage`.
+The check starts its own small Mooncake master when requested and cleans up its
+resources. It does not patch the inference engine or invoke an optimizer.
