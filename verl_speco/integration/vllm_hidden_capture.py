@@ -166,10 +166,11 @@ def install_vllm_hidden_capture_adapter(engine: Any) -> None:
             generator = await generator
         async for item in generator:
             if active is not None and str(request_id) == active.request_id:
-                capture = getattr(item, "hidden_state_capture", None)
+                aux = getattr(item, "aux_outputs", None)
+                capture = getattr(aux, "hidden_state_capture", None)
                 if capture is not None:
                     active.result = capture
-                reason = getattr(item, "hidden_capture_skip_reason", None)
+                reason = getattr(aux, "hidden_capture_skip_reason", None)
                 if reason is not None:
                     active.skip_reason = str(reason)
                 outputs = getattr(item, "outputs", None) or []

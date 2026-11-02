@@ -127,11 +127,18 @@ def _config(**training_overrides):
 
 def test_context_local_adapter_only_marks_the_active_request() -> None:
     seen = []
+    captured = object()
 
     class Engine:
         async def generate(self, *args, **kwargs):
             seen.append(kwargs.copy())
-            yield SimpleNamespace(outputs=[])
+            yield SimpleNamespace(
+                outputs=[],
+                aux_outputs=SimpleNamespace(
+                    hidden_state_capture=captured,
+                    hidden_capture_skip_reason="test-reason",
+                ),
+            )
 
     engine = Engine()
     install_vllm_hidden_capture_adapter(engine)
@@ -164,6 +171,8 @@ def test_context_local_adapter_only_marks_the_active_request() -> None:
     assert seen[0]["sampling_params"].extra_args["existing"] == 7
     assert seen[1]["sampling_params"].extra_args == {"existing": 7}
     assert params.extra_args == {"existing": 7}
+    assert context.result is captured
+    assert context.skip_reason == "test-reason"
 
 
 def test_adapter_install_failure_skips_capture_without_breaking_rollout() -> None:
@@ -267,7 +276,8 @@ def test_real_runner_plan_and_training_sample_layouts(
     width = 4 * (2 + (wire_layout == "aux_final"))
     buffer.add(
         module.HiddenStateCaptureChunk(
-            np.array([4, 5]), torch.ones(2, width, dtype=torch.bfloat16)
+            np.array([4, 5]),
+            {"hidden_states": torch.ones(2, width, dtype=torch.bfloat16)},
         )
     )
     context.result = buffer.finish()
