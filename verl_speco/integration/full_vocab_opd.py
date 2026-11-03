@@ -49,7 +49,7 @@ async def score_teacher_payload(
     transport_config: dict | None = None,
     global_step: int = 0,
     replica_rank: int = 0,
-    chunk_rows: int = 256,
+    chunk_rows: int | None = None,
 ) -> dict:
     """Score supplied tokens and deliver aligned hidden rows plus a logits contract.
 

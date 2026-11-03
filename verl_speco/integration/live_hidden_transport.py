@@ -121,7 +121,7 @@ def release_collection(payload):
         logger.info("[live TQ release] count=%s keys=%s", len(keys), keys)
 
 
-def put_tensor_chunks(sample, training, *, chunk_rows=256):
+def put_tensor_chunks(sample, training, *, chunk_rows=None):
     """Publish row-aligned tensors; return metadata and ordered store references."""
     cfg = training.get("transfer_queue", {})
     if not cfg.get("enable", False):
@@ -130,8 +130,6 @@ def put_tensor_chunks(sample, training, *, chunk_rows=256):
 
     if not bridge.configure_transfer_queue(training):
         raise RuntimeError("Requested tensor transport is unavailable")
-    if chunk_rows < 1:
-        raise ValueError("chunk_rows must be positive")
     run_id = cfg.get("run_id")
     if not run_id:
         raise ValueError("Tensor transport requires a unique run_id")
@@ -139,6 +137,11 @@ def put_tensor_chunks(sample, training, *, chunk_rows=256):
     rows = next(iter(tensors.values())).shape[0]
     if rows < 1 or any(t.shape[0] != rows for t in tensors.values()):
         raise ValueError("Payload tensors must have the same nonempty row dimension")
+    if chunk_rows is None:
+        row_bytes = sum(t.numel() * t.element_size() for t in tensors.values()) // rows
+        chunk_rows = max(1, (16 * 1024**2) // row_bytes)
+    if chunk_rows < 1:
+        raise ValueError("chunk_rows must be positive")
     prefix = f"{run_id}:tensors:{sample['global_step']}:{sample['replica_rank']}:{sample['collection_id']}"
     references, attempted_keys = [], []
     try:

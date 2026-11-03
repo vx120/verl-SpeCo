@@ -187,3 +187,35 @@ def test_tensor_chunks_disabled_keep_inline_payload(transport):
     assert module.put_tensor_chunks(sample, {}) is sample
     assert next(module.iter_tensor_chunks(sample, {})) is sample["tensors"]
     assert not stored
+
+
+def test_default_tensor_delivery_avoids_small_rpc_chunks(transport):
+    module, stored, _, _ = transport
+    original = tensor_sample()
+    original["tensors"] = {
+        "hidden_states": torch.ones(2048, 2048, dtype=torch.bfloat16),
+        "hidden_positions": torch.arange(2048),
+        "response_token_ids": torch.arange(2048),
+    }
+    ref = module.put_tensor_chunks(original, config())
+    assert len(ref["tensor_chunks"]) == 1
+    assert len(stored) == 1
+    assert torch.equal(
+        next(module.iter_tensor_chunks(ref, config()))["hidden_states"],
+        original["tensors"]["hidden_states"],
+    )
+    module.release_tensor_chunks(ref)
+
+
+def test_default_tensor_delivery_bounds_large_payload_chunks(transport):
+    module, _, _, _ = transport
+    original = tensor_sample()
+    original["tensors"] = {
+        "hidden_states": torch.ones(4097, 2048, dtype=torch.bfloat16)
+    }
+    ref = module.put_tensor_chunks(original, config())
+    assert [(c["start"], c["end"]) for c in ref["tensor_chunks"]] == [
+        (0, 4096),
+        (4096, 4097),
+    ]
+    module.release_tensor_chunks(ref)

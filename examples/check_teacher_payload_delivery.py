@@ -25,21 +25,16 @@ from verl_speco.integration.live_hidden_transport import (
 
 
 @ray.remote(num_cpus=1)
-def read_payload(payload, config):
-    from verl_speco.integration import transferqueue_bridge as client
-    from verl_speco.integration.live_hidden_transport import (
-        fingerprint,
-        iter_tensor_chunks,
-    )
-
-    try:
+class PayloadReader:
+    def read(self, payload, config):
         chunks = list(iter_tensor_chunks(payload, config))
         return {
             name: fingerprint(torch.cat([chunk[name] for chunk in chunks]))
             for name in chunks[0]
         }
-    finally:
-        client.close_transfer_queue_client()
+
+    def close(self):
+        bridge.close_transfer_queue_client()
 
 
 def free_port():
@@ -60,6 +55,7 @@ def main(args):
         }
     }
     master = payload = None
+    readers = []
     with ExitStack() as resources:
         try:
             if args.backend == "MooncakeStore":
@@ -140,9 +136,13 @@ def main(args):
                 )
                 for name in ("hidden_states", "hidden_positions", "response_token_ids")
             }
-            readers = [read_payload.remote(payload, config) for _ in range(2)]
-            results = ray.get(readers, timeout=45)
-            assert results == [expected, expected]
+            readers = [PayloadReader.remote() for _ in range(2)]
+            for _ in range(2):
+                results = ray.get(
+                    [reader.read.remote(payload, config) for reader in readers],
+                    timeout=45,
+                )
+                assert results == [expected, expected]
             release_tensor_chunks(payload)
             keys = {r["key"] for r in payload["tensor_chunks"]}
             assert not keys.intersection(bridge.list_samples())
@@ -162,6 +162,8 @@ def main(args):
         finally:
             if payload is not None:
                 release_tensor_chunks(payload)
+            if readers:
+                ray.get([reader.close.remote() for reader in readers], timeout=15)
             client = tq.get_client()
             if client is not None:
                 client.close()

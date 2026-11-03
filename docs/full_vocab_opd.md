@@ -95,3 +95,21 @@ PYTHONPATH=$PWD VLLM_USE_V2_MODEL_RUNNER=1 OMP_NUM_THREADS=2 \
 Add `--synthetic` for a CPU-only store check, or use `--backend SimpleStorage`.
 The check starts its own small Mooncake master when requested and cleans up its
 resources. It does not patch the inference engine or invoke an optimizer.
+
+### Delivery sizing and client lifetime
+
+When `chunk_rows` is omitted, tensor delivery uses chunks of approximately
+16 MiB of raw tensor data. A single row wider than this limit is still sent as
+one row. Explicit `chunk_rows` preserves fixed-row delivery. This avoids repeated
+synchronous store calls for small teacher payloads while bounding large reads.
+The vLLM whole-window buffering boundary is unchanged.
+
+Keep the TQ client alive for a consumer process or actor and close it at teardown.
+With TQ 0.1.10, treat close as terminal for a Mooncake consumer: restarting it
+requires a new worker process. Clearing the closed singleton alone is insufficient
+because real Mooncake reconnect tests also lost backing storage rows. All readers
+and reference cleanup must finish before client closure.
+
+The vLLM logits contract currently covers unquantized Qwen3 and includes the
+checkpoint head weight name. A missing contract means the teacher payload helper
+cannot promise logits reconstruction, even though raw hidden capture still works.
