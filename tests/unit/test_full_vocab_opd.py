@@ -62,8 +62,14 @@ async def test_teacher_payload_aligns_response_tokens_and_contract(monkeypatch):
 
     monkeypatch.setattr(opd, "score_teacher_hidden", score)
     payload = await opd.score_teacher_payload(
-        None, [10, 11, 12], [13, 14], "r", teacher_model="teacher-v1"
+        None,
+        [10, 11, 12],
+        [13, 14],
+        "r",
+        teacher_model="teacher-v1",
+        response_loss_mask=[True, False],
     )
+    assert payload["tensors"]["response_loss_mask"].tolist() == [True, False]
     assert payload["teacher_model"] == "teacher-v1"
     assert payload["prompt_token_ids"] == [10, 11, 12]
     assert payload["tensors"]["response_token_ids"].tolist() == [13, 14]
@@ -75,3 +81,63 @@ async def test_teacher_payload_aligns_response_tokens_and_contract(monkeypatch):
         await opd.score_teacher_payload(
             None, [10, 11, 12], [13, 14], "r", teacher_model="teacher-v1"
         )
+
+
+@pytest.mark.asyncio
+async def test_rollout_masks_preserve_unsupervised_context_and_eos(monkeypatch):
+    from types import SimpleNamespace
+
+    from verl_speco.integration import full_vocab_opd as opd
+
+    batch = {
+        "prompts": torch.tensor([[0, 0, 10, 11], [0, 20, 21, 22]]),
+        "responses": torch.tensor([[12, 13, 0], [23, 0, 0]]),
+        "attention_mask": torch.tensor([[0, 0, 1, 1, 1, 1, 1], [0, 1, 1, 1, 1, 1, 0]]),
+        "response_mask": torch.tensor([[1, 0, 1], [1, 1, 0]]),
+    }
+    original = {k: v.clone() for k, v in batch.items()}
+    calls = []
+
+    async def score(engine, prompt, response, request_id, **kwargs):
+        calls.append((prompt, response, kwargs["response_loss_mask"]))
+        return {"request_id": request_id}
+
+    monkeypatch.setattr(opd, "score_teacher_payload", score)
+    payloads = await opd.score_rollout_teacher_payloads(
+        None, SimpleNamespace(batch=batch), "batch", teacher_model="teacher"
+    )
+    assert calls == [
+        ([10, 11], [12, 13, 0], [True, False, True]),
+        ([20, 21, 22], [23, 0], [True, True]),
+    ]
+    assert [p["sample_index"] for p in payloads] == [0, 1]
+    for key, value in batch.items():
+        assert torch.equal(value, original[key])
+
+
+@pytest.mark.asyncio
+async def test_rollout_scoring_releases_earlier_samples_on_failure(monkeypatch):
+    from types import SimpleNamespace
+
+    from verl_speco.integration import full_vocab_opd as opd
+    from verl_speco.integration import live_hidden_transport as transport
+
+    batch = {
+        "prompts": torch.tensor([[10], [20]]),
+        "responses": torch.tensor([[11], [21]]),
+        "attention_mask": torch.ones(2, 2),
+    }
+    cleared = []
+
+    async def score(engine, prompt, response, request_id, **kwargs):
+        if request_id.endswith("-1"):
+            raise RuntimeError("teacher failed")
+        return {"request_id": request_id}
+
+    monkeypatch.setattr(opd, "score_teacher_payload", score)
+    monkeypatch.setattr(transport, "release_tensor_chunks", cleared.append)
+    with pytest.raises(RuntimeError, match="teacher failed"):
+        await opd.score_rollout_teacher_payloads(
+            None, SimpleNamespace(batch=batch), "batch", teacher_model="teacher"
+        )
+    assert cleared == [{"request_id": "batch-0", "sample_index": 0}]

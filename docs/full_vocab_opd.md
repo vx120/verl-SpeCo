@@ -113,3 +113,49 @@ and reference cleanup must finish before client closure.
 The vLLM logits contract currently covers unquantized Qwen3 and includes the
 checkpoint head weight name. A missing contract means the teacher payload helper
 cannot promise logits reconstruction, even though raw hidden capture still works.
+
+### Collect from a verl rollout batch
+
+`score_rollout_teacher_payloads(engine, rollout, request_prefix, teacher_model=..., transport_config=...)`
+accepts the existing verl `DataProto` with `prompts`, `responses`, and
+`attention_mask`. Left prompt padding and right response padding are removed
+using attention masks, not token IDs, so EOS may also be the padding token.
+Optional `response_mask` becomes the aligned `response_loss_mask` tensor.
+Unsupervised response tokens remain in teacher context; only the loss mask
+excludes them from supervision. Returned manifests retain `sample_index`.
+The input rollout is unchanged. On batch failure/cancellation, earlier published
+samples are released. The caller releases successful batches after all readers.
+
+```python
+payloads = await score_rollout_teacher_payloads(
+    teacher_engine, rollout_output, f"teacher-step-{step}",
+    teacher_model=teacher_checkpoint, transport_config=transport_config,
+    global_step=step,
+)
+try:
+    for payload in payloads:
+        for tensors in iter_tensor_chunks(payload, transport_config):
+            consume_teacher_rows(payload["logits_contract"], tensors)
+finally:
+    for payload in payloads:
+        release_tensor_chunks(payload)
+```
+
+This is a separate full-vocabulary data interface. Existing verl top-k teacher
+logprobs and loss inputs keep their existing schema; hidden manifests must not
+be passed as top-k scores.
+
+For a short dataset-to-consumer acceptance run (no optimizer/training):
+
+```bash
+PYTHONPATH=$PWD VLLM_USE_V2_MODEL_RUNNER=1 OMP_NUM_THREADS=2 \
+  /data/logprob-validation/.venv/bin/python examples/check_teacher_payload_delivery.py \
+  --dataset /data/dataset/aime-2024.parquet --samples 2 --max-tokens 64 \
+  --student-model /data/model/Qwen3-1.7B --model /data/model/Qwen3-4B \
+  --backend MooncakeStore --output /data/segments-validation/opd-rollout-20261103/result.json
+```
+
+The check uses the existing dataset reader, student generation, a real DataProto,
+then teacher scoring and two persistent reader processes. It verifies two reads
+by each reader, all tensor fields (including loss mask), and owner cleanup.
+It does not enable the full-vocabulary training loss in RayPPOTrainer.

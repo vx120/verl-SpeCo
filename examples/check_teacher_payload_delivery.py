@@ -15,7 +15,10 @@ import torch
 import transfer_queue as tq
 
 from verl_speco.integration import transferqueue_bridge as bridge
-from verl_speco.integration.full_vocab_opd import score_teacher_payload
+from verl_speco.integration.full_vocab_opd import (
+    score_rollout_teacher_payloads,
+    score_teacher_payload,
+)
 from verl_speco.integration.live_hidden_transport import (
     fingerprint,
     iter_tensor_chunks,
@@ -55,6 +58,7 @@ def main(args):
         }
     }
     master = payload = None
+    payloads = []
     readers = []
     with ExitStack() as resources:
         try:
@@ -128,31 +132,47 @@ def main(args):
                 )
             else:
                 payload = asyncio.run(capture_teacher(args, config, run_id))
-            json.dumps(payload)
-            assert "tensors" not in payload and len(payload["tensor_chunks"]) == 3
-            expected = {
-                name: fingerprint(
-                    torch.cat([c[name] for c in iter_tensor_chunks(payload, config)])
-                )
-                for name in ("hidden_states", "hidden_positions", "response_token_ids")
-            }
-            readers = [PayloadReader.remote() for _ in range(2)]
-            for _ in range(2):
-                results = ray.get(
-                    [reader.read.remote(payload, config) for reader in readers],
-                    timeout=45,
-                )
-                assert results == [expected, expected]
-            release_tensor_chunks(payload)
-            keys = {r["key"] for r in payload["tensor_chunks"]}
-            assert not keys.intersection(bridge.list_samples())
+            payloads = payload if isinstance(payload, list) else [payload]
             payload = None
+            readers = [PayloadReader.remote() for _ in range(2)]
+            samples = []
+            for item in payloads:
+                json.dumps(item)
+                assert "tensors" not in item
+                chunks = list(iter_tensor_chunks(item, config))
+                expected = {
+                    name: fingerprint(torch.cat([c[name] for c in chunks]))
+                    for name in chunks[0]
+                }
+                for _ in range(2):
+                    results = ray.get(
+                        [reader.read.remote(item, config) for reader in readers],
+                        timeout=45,
+                    )
+                    assert results == [expected, expected]
+                samples.append(
+                    {
+                        "request_id": item.get("request_id"),
+                        "rows": item["tensor_rows"],
+                        "chunks": len(item["tensor_chunks"]),
+                        "fields": list(expected),
+                        "logits_contract": item.get("logits_contract"),
+                    }
+                )
+            keys = {r["key"] for item in payloads for r in item["tensor_chunks"]}
+            while payloads:
+                release_tensor_chunks(payloads[-1])
+                payloads.pop()
+            assert not keys.intersection(bridge.list_samples())
             report = {
                 "backend": args.backend,
                 "synthetic": args.synthetic,
-                "chunks": 3,
-                "rows": 8,
+                "dataset": str(args.dataset) if args.dataset else None,
+                "student_model": args.student_model if args.dataset else None,
+                "teacher_model": args.model,
+                "samples": samples,
                 "readers": 2,
+                "reads_per_reader": 2,
                 "exact": True,
                 "released": True,
                 "training_steps": 0,
@@ -160,8 +180,10 @@ def main(args):
             args.output.write_text(json.dumps(report, indent=2))
             print(json.dumps(report))
         finally:
-            if payload is not None:
+            if payload is not None and not isinstance(payload, list):
                 release_tensor_chunks(payload)
+            for item in payloads:
+                release_tensor_chunks(item)
             if readers:
                 ray.get([reader.close.remote() for reader in readers], timeout=15)
             client = tq.get_client()
@@ -182,12 +204,13 @@ async def capture_teacher(args, config, run_id):
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
 
+    rollout = await generate_rollout_batch(args) if args.dataset else None
     engine = AsyncLLM.from_engine_args(
         AsyncEngineArgs(
             model=args.model,
             dtype="bfloat16",
-            max_model_len=64,
-            max_num_seqs=1,
+            max_model_len=4096 if args.dataset else 64,
+            max_num_seqs=args.samples if args.dataset else 1,
             gpu_memory_utilization=0.35,
             enforce_eager=True,
             async_scheduling=False,
@@ -195,6 +218,14 @@ async def capture_teacher(args, config, run_id):
         )
     )
     try:
+        if rollout is not None:
+            return await score_rollout_teacher_payloads(
+                engine,
+                rollout,
+                run_id,
+                teacher_model=args.model,
+                transport_config=config,
+            )
         return await score_teacher_payload(
             engine,
             [100, 200, 300, 400],
@@ -208,6 +239,95 @@ async def capture_teacher(args, config, run_id):
         engine.shutdown()
 
 
+async def generate_rollout_batch(args):
+    from itertools import islice
+
+    from verl import DataProto
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.sampling_params import RequestOutputKind, SamplingParams
+    from vllm.v1.engine.async_llm import AsyncLLM
+
+    from verl_speco.integration.vllm_runtime import (
+        patch_transformers_attention_layer_type_constants,
+    )
+    from verl_speco.producer.input_reader import iter_input_records
+
+    patch_transformers_attention_layer_type_constants()
+    student = AsyncLLM.from_engine_args(
+        AsyncEngineArgs(
+            model=args.student_model,
+            dtype="bfloat16",
+            max_model_len=4096,
+            max_num_seqs=args.samples,
+            gpu_memory_utilization=0.35,
+            enforce_eager=True,
+            async_scheduling=False,
+        )
+    )
+    try:
+        tokenizer = student.get_tokenizer()
+        prompts, responses = [], []
+        for record in islice(
+            iter_input_records(args.dataset, on_error="raise"), args.samples
+        ):
+            prompt = (
+                tokenizer.encode(record.prompt)
+                if isinstance(record.prompt, str)
+                else tokenizer.encode(
+                    tokenizer.apply_chat_template(
+                        list(record.prompt),
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=False,
+                    ),
+                    add_special_tokens=False,
+                )
+            )
+            if len(prompt) + args.max_tokens > 4096:
+                raise ValueError(
+                    "Dataset prompt exceeds this short-check context limit"
+                )
+            async for output in student.generate(
+                {"prompt_token_ids": prompt},
+                SamplingParams(
+                    temperature=0,
+                    max_tokens=args.max_tokens,
+                    output_kind=RequestOutputKind.FINAL_ONLY,
+                ),
+                f"student-{record.sample_id}",
+            ):
+                if output.finished:
+                    prompts.append(prompt)
+                    responses.append(list(output.outputs[0].token_ids))
+        if not prompts:
+            raise ValueError("Dataset has no samples")
+        prompt_width = max(map(len, prompts))
+        response_width = max(map(len, responses))
+        prompt_batch = torch.full(
+            (len(prompts), prompt_width), tokenizer.pad_token_id, dtype=torch.long
+        )
+        response_batch = torch.full(
+            (len(prompts), response_width), tokenizer.pad_token_id, dtype=torch.long
+        )
+        attention = torch.zeros(
+            len(prompts), prompt_width + response_width, dtype=torch.long
+        )
+        for i, (prompt, response) in enumerate(zip(prompts, responses, strict=True)):
+            prompt_batch[i, -len(prompt) :] = torch.tensor(prompt)
+            response_batch[i, : len(response)] = torch.tensor(response)
+            attention[i, prompt_width - len(prompt) : prompt_width + len(response)] = 1
+        return DataProto.from_dict(
+            tensors={
+                "prompts": prompt_batch,
+                "responses": response_batch,
+                "attention_mask": attention,
+                "response_mask": attention[:, prompt_width:].clone(),
+            }
+        )
+    finally:
+        student.shutdown()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -215,5 +335,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--model", default="/data/model/Qwen3-1.7B")
     parser.add_argument("--synthetic", action="store_true")
+    parser.add_argument("--dataset", type=Path)
+    parser.add_argument("--student-model", default="/data/model/Qwen3-1.7B")
+    parser.add_argument("--samples", type=int, default=2)
+    parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--output", type=Path, required=True)
     main(parser.parse_args())

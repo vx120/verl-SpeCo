@@ -50,6 +50,7 @@ async def score_teacher_payload(
     global_step: int = 0,
     replica_rank: int = 0,
     chunk_rows: int | None = None,
+    response_loss_mask: list[bool] | None = None,
 ) -> dict:
     """Score supplied tokens and deliver aligned hidden rows plus a logits contract.
 
@@ -62,6 +63,8 @@ async def score_teacher_payload(
 
     if not response_ids:
         raise ValueError("response_ids must not be empty")
+    if response_loss_mask is not None and len(response_loss_mask) != len(response_ids):
+        raise ValueError("response_loss_mask must align with response_ids")
     result = await score_teacher_hidden(engine, prompt_ids, response_ids, request_id)
     positions = torch.from_numpy(result.hidden_positions.copy())
     start = len(prompt_ids) - 1
@@ -88,7 +91,69 @@ async def score_teacher_payload(
             "response_token_ids": torch.tensor(response_ids, dtype=torch.long),
         },
     }
+    if response_loss_mask is not None:
+        payload["tensors"]["response_loss_mask"] = torch.tensor(
+            response_loss_mask, dtype=torch.bool
+        )
     return put_tensor_chunks(payload, transport_config or {}, chunk_rows=chunk_rows)
+
+
+async def score_rollout_teacher_payloads(
+    engine: Any,
+    rollout: Any,
+    request_prefix: str,
+    *,
+    teacher_model: str,
+    transport_config: dict | None = None,
+    global_step: int = 0,
+    replica_rank: int = 0,
+    chunk_rows: int | None = None,
+) -> list[dict]:
+    """Score a verl rollout batch without changing its tensors or loss path.
+
+    Attention masks remove padding; response_mask selects supervised rows but
+    does not remove context tokens. The caller owns all returned store keys.
+    """
+    from verl_speco.integration.live_hidden_transport import release_tensor_chunks
+
+    batch = rollout.batch
+    prompts, responses = batch["prompts"], batch["responses"]
+    attention = batch["attention_mask"].bool()
+    width = prompts.shape[1]
+    if attention.shape != (prompts.shape[0], width + responses.shape[1]):
+        raise ValueError("attention_mask must cover prompts and responses")
+    loss_mask = batch.get("response_mask", attention[:, width:]).bool()
+    if loss_mask.shape != responses.shape:
+        raise ValueError("response_mask must align with responses")
+    payloads = []
+    try:
+        for index in range(prompts.shape[0]):
+            prompt_ids = prompts[index][attention[index, :width]].tolist()
+            response_attention = attention[index, width:]
+            response_ids = responses[index][response_attention].tolist()
+            if not prompt_ids or not response_ids:
+                raise ValueError(
+                    f"Rollout row {index} needs prompt and response tokens"
+                )
+            payload = await score_teacher_payload(
+                engine,
+                prompt_ids,
+                response_ids,
+                f"{request_prefix}-{index}",
+                teacher_model=teacher_model,
+                transport_config=transport_config,
+                global_step=global_step,
+                replica_rank=replica_rank,
+                chunk_rows=chunk_rows,
+                response_loss_mask=loss_mask[index][response_attention].tolist(),
+            )
+            payload["sample_index"] = index
+            payloads.append(payload)
+    except BaseException:
+        for payload in payloads:
+            release_tensor_chunks(payload)
+        raise
+    return payloads
 
 
 def reverse_kl_from_hidden(
