@@ -9,7 +9,7 @@ TRACE_KEY = "_speco_verify_trace"
 TURN_TRACES = contextvars.ContextVar("speco_verify_turns", default=None)
 
 
-def snapshot_verify_step(scheduler, scheduled, output):
+def snapshot_verify_step(scheduler, scheduled, output, *, capture_draft_tokens=False):
     """Read CPU counts before Scheduler mutates generated tokens or frees requests."""
     snapshots = []
     for rid in scheduled.num_scheduled_tokens:
@@ -25,15 +25,34 @@ def snapshot_verify_step(scheduler, scheduled, output):
         drafts = len(scheduled.scheduled_spec_decode_tokens.get(rid, ()))
         if scheduled.num_invalid_spec_tokens:
             drafts -= scheduled.num_invalid_spec_tokens.get(rid, 0)
-        snapshots.append(
-            (rid, request, len(request._output_token_ids), drafts, generated)
-        )
+        tokens = None
+        if capture_draft_tokens and generated:
+            tokens = list(scheduled.scheduled_spec_decode_tokens.get(rid, ()))[:drafts]
+            admitted = any(
+                item.req_id == rid for item in getattr(scheduled, "scheduled_new_reqs", ())
+            )
+            # Scheduler.schedule pads newly admitted/resumed decode requests
+            # with -1 for uniform CUDA graphs. They have no actual proposal.
+            if admitted and generated == 1 and tokens and all(t == -1 for t in tokens):
+                drafts, tokens = 0, []
+            if any(not isinstance(token, int) or token < 0 for token in tokens):
+                raise ValueError(
+                    "Draft-OPD replay requires concrete valid draft token IDs; "
+                    f"request={rid!r}, generated={generated}, drafts={drafts}, "
+                    f"admitted={admitted}, tokens={tokens!r}. "
+                    "Check CUDA worker log for 'V2 real proposal CPU copy installed'."
+                )
+        snapshot = (rid, request, len(request._output_token_ids), drafts, generated)
+        if tokens is not None:
+            snapshot += (tokens,)
+        snapshots.append(snapshot)
     return snapshots
 
 
 def finish_verify_step(snapshots, *, layout, capacity):
     traces = {}
-    for rid, request, before, drafts, generated in snapshots:
+    for snapshot in snapshots:
+        rid, request, before, drafts, generated = snapshot[:5]
         prompt_len = len(request.prompt_token_ids)
         trace = getattr(request, TRACE_KEY, None)
         if trace is None:
@@ -57,6 +76,8 @@ def finish_verify_step(snapshots, *, layout, capacity):
                     "truncated": commit < generated,
                 }
             )
+            if len(snapshot) == 6:
+                trace["steps"][-1]["draft_token_ids"] = snapshot[5]
         trace["response_length"] = len(request._output_token_ids)
         traces[rid] = trace
     return traces
@@ -70,6 +91,17 @@ def validate_verify_trace(trace, *, layout, capacity):
             f"trace layout={trace['layout']}, num_spec_tokens={trace['num_spec_tokens']}; "
             f"expected layout={layout}, num_spec_tokens={capacity}"
         )
+    if trace.get("kind") == "draft_branch_replay":
+        tokens = trace["draft_token_ids"]
+        if (
+            not 0 < len(tokens) <= capacity
+            or any(type(token) is not int or token < 0 for token in tokens)
+            or not 0 <= trace["accepted"] <= len(tokens)
+            or trace["anchor"] != trace["prompt_length"] - 1
+            or trace["response_length"] != len(tokens)
+        ):
+            raise ValueError("Invalid Draft-OPD branch replay metadata")
+        return
     cursor = trace["prompt_length"] - 1
     for step in trace["steps"]:
         c, n, a, raw = (
@@ -83,6 +115,11 @@ def validate_verify_trace(trace, *, layout, capacity):
             or step["truncated"] != (c < raw)
         ):
             raise ValueError("Invalid Draft-OPD verify step or token coordinates")
+        tokens = step.get("draft_token_ids")
+        if tokens is not None and (
+            len(tokens) != n or any(type(token) is not int or token < 0 for token in tokens)
+        ):
+            raise ValueError("Invalid Draft-OPD proposal token IDs")
         cursor += c
     if cursor + 1 - trace["prompt_length"] != trace["response_length"]:
         raise ValueError("Draft-OPD committed tokens do not cover the response")

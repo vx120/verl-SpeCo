@@ -1,10 +1,8 @@
 # Draft-OPD GPU L1 实现说明
 
-Last updated: 11/16/2026
-
 日期：2026-11-04。代码范围：仅 verl-SpeCo。支持 DFlash 和标准 anchor-as-first DSpark。
 
-本次交付设计中的 P1 L1：记录真实验证计数，在真实验证起点训练 CE 或 E2E TV，并可组合已实现的 VAT。没有修改 Draft-OPD 参考仓库或 vLLM fork。L2 的被拒 token/logprob、suffix-k3、bonus-anchor、SPARK 和 NPU 不在本次交付中。
+初始交付为 P1 L1：记录真实验证计数，在真实验证起点训练 CE 或 E2E TV，并可组合已实现的 VAT。2026-11-17 增加 actor teacher-forcing 的完整提案分支重放，见 [完整重放说明](opd_full_replay.md)。没有修改 Draft-OPD 参考仓库或 vLLM fork；suffix-k3、bonus-anchor、SPARK 和 NPU 仍不在范围内。
 
 ## 修改及原因
 
@@ -50,10 +48,12 @@ feature store 已逐项保留 metadata，TQ 使用同一 feature payload，因�
 ```yaml
 enable: false
 capture_verify_trace: false
-anchor_planner: mixed
+replay_full_suffix: false
+replay_max_blocks_per_sample: 32
+anchor_planner: trace
 random_anchor_ratio: 0.25
 loss: e2e_tv
-first_reject_weight: 2.0
+first_reject_weight: 1.0
 chunk_size: 1024
 ```
 
@@ -63,7 +63,7 @@ chunk_size: 1024
 - `trace`：从当前窗口的有效验证起点随机无放回选择。
 - `mixed`：随机配额为 `ceil(num_anchors * random_anchor_ratio)`，其余配额用于 trace。trace 不足时对应 block 保持无效，不补随机 block；两类 anchor 允许重合。
 
-trace block 只监督实际可见的已接受前缀及首拒位置。全接受块只监督有效 draft，不把额外 bonus 当作 draft；EOS 截断只监督已提交位置，不捏造拒绝标签。slot 映射为 DFlash 的 `j+1` 和 DSpark 的 `j`。
+截断模式的 trace block 只监督实际可见的已接受前缀及首拒位置。全接受块只监督有效 draft，不把额外 bonus 当作 draft；EOS 截断只监督已提交位置，不捏造拒绝标签。完整模式另行重放提案并覆盖全部 draft 位置，排除提交截断块。slot 映射为 DFlash 的 `j+1` 和 DSpark 的 `j`。
 
 `loss=ce` 使用现有主损失：DFlash CE（以及显式配置的 LK），DSpark CE/L1/LK。trace 前缀不使用原来的固定位置衰减，真实可见首拒位乘 `first_reject_weight`；random block 保留固定衰减。DFlash 原有 front-position 权重仍有效，示例将其设为 1，避免混入额外位置加权。
 
@@ -100,18 +100,21 @@ bash examples/run_qwen3-8b-drafter_opd_dflash_vllm.sh
 bash examples/run_qwen3-8b-drafter_opd_dspark_vllm.sh
 ```
 
-脚本设置 GPU MRv2、full_vocab、mixed + E2E TV、同步发布、单步样本保留和禁用 data buffer。TV 温度 0.6 与基础 rollout 温度一致。GPU 数和 TP 沿用基础示例，需按实际资源覆盖。
+脚本设置 GPU MRv2、full_vocab、trace + E2E TV、完整提案重放、首拒权重 1、同步发布、单步样本保留和禁用 data buffer。TV 温度默认 1，rollout 温度仍为 0.6，显式保持 greedy 起草。完整模式每条选中的源轨迹默认采样最多 32 个完整推测块，每个分支样本只训练自己的一个锚点；256 锚点预算只用于截断模式。训练及 hidden 采集窗口均为 2048。GPU 数和 TP 沿用基础示例，需按实际资源覆盖。受控消融见 [消融说明](vat_opd_ablations.md)。
 
 消融与组合通过末尾参数覆盖：
 
 ```bash
-# Trace-only CE + 首拒倍权
+# Trace-only CE + 首拒倍权消融
 bash examples/run_qwen3-8b-drafter_opd_dflash_vllm.sh \
   actor_rollout_ref.rollout.drafter.training.drafter_opd.anchor_planner=trace \
+  actor_rollout_ref.rollout.drafter.training.drafter_opd.first_reject_weight=2.0 \
+  actor_rollout_ref.rollout.drafter.training.drafter_opd.replay_full_suffix=false \
   actor_rollout_ref.rollout.drafter.training.drafter_opd.loss=ce
 
 # DSpark Draft-OPD + VAT
 bash examples/run_qwen3-8b-drafter_opd_dspark_vllm.sh \
+  actor_rollout_ref.rollout.drafter.training.drafter_opd.replay_full_suffix=false \
   actor_rollout_ref.rollout.drafter.training.dspark_per_position_loss_weight=vat \
   actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha=1.0
 ```
@@ -124,7 +127,7 @@ bash examples/run_qwen3-8b-drafter_opd_dspark_vllm.sh \
 
 以下边界明确保留：
 
-- 仅 GPU、DFlash/标准 DSpark、full_vocab；packing 显式拒绝。未实现设计中的密度选窗、staleness 淘汰和 L2/k3。
+- 仅 GPU、DFlash/标准 DSpark、full_vocab；packing 显式拒绝。未实现设计中的密度选窗、staleness 淘汰和 suffix-k3。
 - serving revision 范围随轨迹保留，但训练不据此宣称严格 on-policy；重复优化同一轨迹、异步更新及旧 target hidden 都可能造成策略差异。
 - TV 来自原始 LM logits，经指定温度归一化，没有重放 top-p/top-k、penalty 或 grammar processor。即使温度一致，也不把 TV 链称为 greedy draft 场景的真实 rollout 期望接受长度。
 - 多轮/续跑有坐标与 token 一致性测试；GPU async scheduling、preemption、完整训练 checkpoint/optimizer 恢复、FSDP2 空 rank collective、vLLM 热发布和 AL/耗时/显存收益仍需实机验证。没有 GPU 收益结论。
@@ -252,45 +255,3 @@ python -m pytest tests/unit/test_training_outcome_metrics.py tests/unit/test_dra
 ```
 
 结果 **36 passed**；两个 Python 文件通过 Ruff，`git diff --check` 通过。未验证 GPU 实际日志；同步修改并重新启动作业后观察上述字段。
-
-
-## Ray transport fixes and Ascend validation (2026-11-16)
-
-The HTTP bridge now owns forwarding methods on its serialized subclass, so a
-fresh Ray worker importing the unpatched upstream base retains collection and
-configuration restoration. Reinstalling an early bridge refreshes its resolved
-configuration instead of retaining an empty snapshot. The launcher passes the
-resolved drafter configuration through the Ray job, TaskRunner and HTTP actor
-runtime environments, including when upstream supplies actor-specific options.
-
-Draft-OPD now accepts `trainer.device=npu` as well as CUDA. In the development
-environment, actual small-model DFlash/DSpark CE and E2E-TV NPU backward checks
-passed; a DSpark two-step RL debug run collected eight samples per step, advanced
-the drafter optimizer to steps 1 and 2 and published both updates. This bounded
-run does not establish model quality, performance or support for every runtime.
-The baseline old-logprob feature collector still requires remove-padding;
-short-run response/window lengths must leave enough rows for collection.
-
-The transfer preserves this branch's VAT and weighted E2E-TV behavior. It does
-not add SpecOPD collection or tree scoring. Local transport/objective regression:
-267 passed, 7 skipped (upstream verl unavailable). Seven new regression cases
-failed before the fix, including fresh-interpreter cloudpickle, late config,
-actor runtime environment propagation and NPU launch checks.
-
-
-Validation command:
-
-```bash
-python -m pytest -q -rs tests/integration/test_vllm_runtime_contract.py \
-  tests/integration/test_native_bypass_contract.py \
-  tests/integration/test_verify_trace_runtime.py \
-  tests/integration/test_drafter_config_env.py \
-  tests/integration/test_agent_loop_runtime_contract.py \
-  tests/unit/test_drafter_opd.py tests/unit/test_vat_loss.py \
-  tests/unit/test_training_outcome_metrics.py
-```
-
-Ruff checks, license, device-boundary and diff-whitespace checks pass. The
-repository-wide documentation-date check still reports three unchanged files:
-`draft_opd_vat_spark_design.md`, `draft_opd_vat_spark_design_review.md` and
-`dspark_vat_publish_fix.md`. They already lack `Last updated` on the source branch.

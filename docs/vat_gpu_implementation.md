@@ -46,7 +46,7 @@ bash examples/run_qwen3-8b-vat_drafter_dflash_vllm.sh
 bash examples/run_qwen3-8b-vat_drafter_dspark_vllm.sh
 ```
 
-两个脚本设置 GPU MRv2 环境变量，调用基础 GPU 示例并传入 VAT 参数。GPU 数、TP 等沿用基础示例；请按机器资源调整基础示例已有参数。DSpark 脚本设置 `dspark_confidence_head_alpha=1`，让现有模型构建逻辑启用 confidence head；其 VAT loss 系数由下表控制。
+两个脚本设置 GPU MRv2 环境变量，调用基础 GPU 示例并传入 VAT 参数，显式覆盖为 full_vocab，避免继承基础示例的 restricted_ce。DFlash VAT 示例将 front-position 权重设为 1、数量设为 0，去掉基础示例的前 3 位两倍加权；损失实现仍支持显式开启该消融。GPU 数、TP 等沿用基础示例；请按机器资源调整基础示例已有参数。DSpark 脚本设置 `dspark_confidence_head_alpha=1`，让现有模型构建逻辑启用 confidence head；其 VAT loss 系数由下表控制。受控消融见 [消融说明](vat_opd_ablations.md)。
 
 | `actor_rollout_ref.rollout.drafter.training.vat` 字段 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -80,7 +80,7 @@ CPU 数值测试将分块 VAT loss 和梯度与独立的稠密公式比较，覆
 尚需在 GPU 环境执行：FSDP2 多 rank 空有效块、完整训练 checkpoint 恢复、vLLM 热发布与 rollout，以及 B0/V1/V2 的真实 AL、耗时和显存比较。CPU 空行梯度测试不能证明 FSDP2 不挂起。当前没有 GPU 收益结论。
 
 
-本机验证结果：VAT/D-PACE 单测与 backend 回归共 107 passed、1 skipped；发布过滤测试另有 1 passed。Ruff、Python 编译和 git diff --check 通过。示例完成 shell token 解析与 OmegaConf 参数合并检查；本机 Bash 不可用，未执行 bash -n 或实际训练启动。
+本机验证结果：VAT/D-PACE 单测与 backend 回归共 107 passed、1 skipped；发布过滤测试另有 1 passed。Ruff、Python 编译和 git diff --check 通过。后续联合回归结果见 docs/drafter_opd_gpu_implementation.md。示例现已通过 Git Bash 语法检查及使用 python3 参数替身的实际参数合并检查；没有启动训练。
 
 复现 CPU 测试时需先安装项目指定的 verl 依赖，再运行：
 

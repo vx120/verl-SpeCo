@@ -5663,6 +5663,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             prompt_len = int(prompt_lens[batch_idx])
             response_len = int(response_lens[batch_idx])
             valid_positions = hidden_positions[batch_idx].reshape(-1)
+            if collect_plan.get("hidden_position_mask") is not None:
+                valid_positions = valid_positions[
+                    collect_plan["hidden_position_mask"][batch_idx].reshape(-1).bool()
+                ]
             valid_rows = int(valid_positions.numel())
             if valid_rows <= 0:
                 skipped_empty_positions += 1
@@ -8552,6 +8556,31 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             collect_plan = self._speco_build_oldlogprob_collect_plan(batch)
             if collect_plan is None:
                 return compute_old_log_prob_without_collection()
+            replay_cfg = self._speco_drafter_training_config().get("drafter_opd", {})
+            if replay_cfg.get("enable", False) and replay_cfg.get("replay_full_suffix", False):
+                from verl_speco.integration.opd_replay import expand_replay_batch
+
+                if str(self.config.actor_rollout_ref.actor.strategy) not in {"fsdp", "fsdp2"}:
+                    raise ValueError("Draft-OPD full replay currently requires the FSDP actor collection path")
+                expanded = expand_replay_batch(
+                    batch, collect_plan,
+                    max_blocks=int(replay_cfg.get("replay_max_blocks_per_sample", 32)),
+                    pad_token_id=int(self.tokenizer.pad_token_id or 0),
+                    seed=int(self.global_steps),
+                )
+                if expanded is None:
+                    return compute_old_log_prob_without_collection()
+                replay_tensors, replay_metadata, collect_plan = expanded
+                batch = DataProto.from_dict(
+                    tensors=replay_tensors, non_tensors=replay_metadata,
+                    meta_info=dict(batch.meta_info),
+                )
+                self._speco_last_oldlogprob_planned_samples = collect_plan["selected_count"]
+                print(
+                    f"[speco opd replay] step={self.global_steps} "
+                    f"source_rows={len(original_batch)} actor_rows={len(batch)} "
+                    f"replay_blocks={collect_plan['selected_count']}", flush=True,
+                )
             batch_td = batch.to_tensordict()
             batch_td = left_right_2_no_padding(batch_td)
             calculate_entropy = self._speco_oldlogprob_calculate_entropy()
@@ -8682,6 +8711,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     {"old_log_probs": log_probs.float(), "entropys": entropy.float()}
                 )
             old_log_prob = DataProto.from_tensordict(old_log_prob)
+            # Replay rows have target features but must never become PPO samples.
+            if len(batch) > len(original_batch):
+                old_log_prob = old_log_prob[:len(original_batch)]
+                response_width = original_batch.batch["responses"].shape[1]
+                for key in ("old_log_probs", "entropys"):
+                    old_log_prob.batch[key] = old_log_prob.batch[key][:, :response_width]
             self._speco_last_oldlogprob_total_elapsed_sec = (
                 time.perf_counter() - oldlogprob_started
             )

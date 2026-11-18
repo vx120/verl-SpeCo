@@ -13,7 +13,8 @@ from verl_speco.integration.verify_trace import TRACE_KEY, validate_verify_trace
 
 
 def preprocess_trace(
-    item, *, start, end, layout, capacity, device, aligned_next_tokens=False
+    item, *, start, end, layout, capacity, device, aligned_next_tokens=False,
+    require_full_suffix=False,
 ):
     trace = item.get(TRACE_KEY)
     if trace is None:
@@ -24,6 +25,21 @@ def preprocess_trace(
         + start
         - trace.get("token_offset", 0)
     )
+    if trace.get("kind") == "draft_branch_replay":
+        validate_verify_trace(trace, layout=layout, capacity=capacity)
+        anchor = trace["anchor"] - origin
+        if 0 <= anchor < end - start:
+            visible = min(len(trace["draft_token_ids"]), end - start - anchor - 1 + int(aligned_next_tokens))
+            if visible != len(trace["draft_token_ids"]):
+                raise ValueError("Draft-OPD full replay window cuts the proposal suffix")
+            plan[anchor] = torch.tensor(
+                [trace["accepted"], visible, int(trace["accepted"] < visible)], device=device,
+            )
+        else:
+            raise ValueError("Draft-OPD full replay window does not contain its anchor")
+        return plan
+    if require_full_suffix:
+        raise ValueError("Draft-OPD full replay requires actor-scored draft branch features")
     turns = trace["turns"] if "turns" in trace else [trace]
     last_end = -1
     for turn in turns:
@@ -53,11 +69,17 @@ class DraftOPDObjective(nn.Module):
         super().__init__()
         self.layout = layout
         self.temperature = float(temperature)
-        self.planner = config.get("anchor_planner", "mixed")
+        self.planner = config.get("anchor_planner", "trace")
         self.random_ratio = float(config.get("random_anchor_ratio", 0.25))
         self.loss_type = config.get("loss", "e2e_tv")
-        self.reject_weight = float(config.get("first_reject_weight", 2.0))
+        self.reject_weight = float(config.get("first_reject_weight", 1.0))
         self.chunk_size = int(config.get("chunk_size", 1024))
+        self.full_replay = bool(config.get("replay_full_suffix", False))
+        if config.get("replay_full_suffix", False) and (
+            self.loss_type != "e2e_tv" or self.planner != "trace"
+            or per_position_loss_weight != "fixed_exp_decay"
+        ):
+            raise ValueError("Draft-OPD full replay requires trace + e2e_tv without VAT")
         if self.planner not in {"random", "trace", "mixed"} or self.loss_type not in {
             "ce",
             "e2e_tv",

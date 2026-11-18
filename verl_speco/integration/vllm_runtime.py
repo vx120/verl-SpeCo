@@ -3102,7 +3102,10 @@ def patch_vllm_request_acceptance_stats() -> bool:
                 from verl_speco.integration.verify_trace import snapshot_verify_step
                 if self.num_sampled_tokens_per_step != 1:
                     raise ValueError("Draft-OPD requires one target correction/bonus token per step")
-                snapshots = snapshot_verify_step(self, scheduler_output, model_runner_output)
+                snapshots = snapshot_verify_step(
+                    self, scheduler_output, model_runner_output,
+                    capture_draft_tokens=bool(opd_cfg.get("training", {}).get("drafter_opd", {}).get("replay_full_suffix", False)),
+                )
             engine_core_outputs = original_update_from_output(
                 self, scheduler_output, model_runner_output
             )
@@ -3398,6 +3401,9 @@ def patch_vllm_engine_core_entrypoint() -> bool:
 
 
 def _speco_vllm_worker_main_with_runtime_observability(*args, **kwargs):
+    from verl_speco.integration.opd_vllm_tokens import patch_v2_draft_token_copy
+
+    patch_v2_draft_token_copy()
     _maybe_apply_vllm_ascend_global_patch()
     patch_vllm_dflash_config_aliases()
     patch_vllm_dspark_registry_aliases()
@@ -3421,8 +3427,7 @@ def _speco_vllm_worker_main_with_runtime_observability(*args, **kwargs):
 def patch_vllm_worker_proc_entrypoint() -> bool:
     """Install runtime patches inside vLLM worker subprocesses."""
 
-    if not _maybe_apply_vllm_ascend_global_patch():
-        return False
+    _maybe_apply_vllm_ascend_global_patch()
     try:
         from vllm.v1.executor import multiproc_executor
     except Exception as exc:  # noqa: BLE001
@@ -3475,6 +3480,9 @@ def install_vllm_spec_decode_acceptance_logging() -> bool:
 
 def install_vllm_runtime_observability() -> bool:
     """Install lightweight vLLM logging hooks for all rollout modes."""
+    from verl_speco.integration.opd_vllm_tokens import patch_v2_draft_token_copy
+
+    patch_v2_draft_token_copy()
 
     _maybe_apply_vllm_ascend_global_patch()
     dflash_config_patched = patch_vllm_dflash_config_aliases()
@@ -4025,6 +4033,9 @@ class _SpecoVLLMHttpServerMixin:
         return await super().launch_server(*args, **kwargs)
 
     async def run_server(self, args):
+        from verl_speco.integration.opd_vllm_tokens import enforce_replay_engine_args
+
+        enforce_replay_engine_args(args)
         try:
             import inspect
 
@@ -4534,33 +4545,13 @@ def _build_speco_vllm_http_server_class(upstream_module: Any):
             upstream_cls._speco_drafter_config_env = drafter_config_env
         return upstream_cls
     if bool(getattr(upstream_cls, "_speco_vllm_http_methods_patched", False)):
-        # Ray imports the base by reference in a fresh process. Keep the
-        # patched methods on the by-value subclass as well; inheriting them
-        # loses launch config restoration and proposal capture after import.
-        namespace = {
-            "__module__": __name__,
-            "_speco_drafter_config_env": drafter_config_env,
-        }
-        from functools import wraps
-
-        def own_bridge(method):
-            @wraps(method)
-            async def routed(self, *args, **kwargs):
-                return await method(self, *args, **kwargs)
-
-            return routed
-
-        for name in ("launch_server", "run_server", "generate", "speco_generate_probe"):
-            method = getattr(upstream_cls, name, None)
-            if method is not None:
-                # Cloudpickle removes class entries identical to inherited
-                # entries. A distinct forwarding closure must retain this
-                # bridge even when the imported base is pristine remotely.
-                namespace[name] = own_bridge(method)
         return type(
             "SpecoVLLMHttpServer",
-            (_SpecoVLLMHttpServerMixin, upstream_cls),
-            namespace,
+            (upstream_cls,),
+            {
+                "__module__": __name__,
+                "_speco_drafter_config_env": drafter_config_env,
+            },
         )
     return type(
         "SpecoVLLMHttpServer",
@@ -4581,15 +4572,12 @@ class _SpecoVLLMHttpServerActorClass:
     )
     _SETUP_HOOK_ENV_VAR = "__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR"
 
-    def __init__(self, actor_class: Any, drafter_config_env: str | None = None):
+    def __init__(self, actor_class: Any):
         self._actor_class = actor_class
-        self._drafter_config_env = drafter_config_env
 
     def options(self, **options):
         runtime_env = dict(options.get("runtime_env", {}) or {})
         env_vars = dict(runtime_env.get("env_vars", {}) or {})
-        if self._drafter_config_env:
-            env_vars[SPECO_DRAFTER_CONFIG_ENV] = self._drafter_config_env
         if "VERL_SPECO_PHASE_TIMING" in os.environ:
             env_vars.setdefault(
                 "VERL_SPECO_PHASE_TIMING", os.environ["VERL_SPECO_PHASE_TIMING"]
@@ -4614,11 +4602,7 @@ class _SpecoVLLMHttpServerActorClass:
 def _remote_speco_vllm_http_server(ray_module: Any, server_cls: type[Any]) -> Any:
     """Create the HTTP actor with import compatibility active at process start."""
 
-    return _SpecoVLLMHttpServerActorClass(
-        ray_module.remote(server_cls),
-        getattr(server_cls, "_speco_drafter_config_env", None)
-        or get_drafter_config_env(),
-    )
+    return _SpecoVLLMHttpServerActorClass(ray_module.remote(server_cls))
 
 
 def _patch_upstream_vllm_http_server_methods(upstream_cls: type[Any]) -> bool:
@@ -4686,6 +4670,9 @@ def _patch_upstream_vllm_http_server_methods(upstream_cls: type[Any]) -> bool:
         return await original_launch_server(self, *args, **kwargs)
 
     async def run_server_with_speco_stats(self, args):
+        from verl_speco.integration.opd_vllm_tokens import enforce_replay_engine_args
+
+        enforce_replay_engine_args(args)
         try:
             from vllm.v1.engine.async_llm import AsyncLLM
         except Exception:  # noqa: BLE001
@@ -4768,14 +4755,13 @@ def install_upstream_vllm_runtime_bridge() -> bool:
         return False
 
     _patch_upstream_vllm_http_server_methods(vllm_async_server.vLLMHttpServer)
-    # Early worker bootstrap can precede configuration; refresh on reinstall.
-    speco_http_server_cls = _build_speco_vllm_http_server_class(vllm_async_server)
     if bool(getattr(upstream_replica, "_speco_vllm_replica_bridge", False)):
         registry = getattr(replica_module, "RolloutReplicaRegistry", None)
         if registry is not None and hasattr(registry, "_registry"):
             registry._registry["vllm"] = lambda: upstream_replica
         _VLLM_REPLICA_PATCHED = True
         return True
+    speco_http_server_cls = _build_speco_vllm_http_server_class(vllm_async_server)
 
     upstream_replica_base = cast(type[Any], upstream_replica)
 
@@ -4851,10 +4837,24 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
                 f"expected spec_verify_tokens={capacity}. "
                 "DFlash block_size includes the anchor; DSpark block_size counts draft positions."
             )
-        if _get_nested(config, ("trainer", "device"), "cuda") not in {"cuda", "npu"}:
-            raise ValueError("Draft-OPD requires CUDA or Ascend NPU")
+        if _get_nested(config, ("trainer", "device"), "cuda") != "cuda":
+            raise ValueError("Draft-OPD currently supports GPU only")
         if drafter_cfg["training"].get("packing", {}).get("enable", False):
             raise ValueError("Draft-OPD currently requires packing.enable=false")
+        if opd_cfg.get("replay_full_suffix", False):
+            training = drafter_cfg["training"]
+            if (
+                _get_nested(config, ("trainer", "use_v1"), False)
+                or _get_nested(config, ("actor_rollout_ref", "actor", "strategy"), "fsdp2") not in {"fsdp", "fsdp2"}
+                or not training.get("collect_hidden_states_from_old_logprob", False)
+            ):
+                raise ValueError("Draft-OPD full replay requires trainer.use_v1=false, an FSDP actor and old-logprob collection")
+            if (
+                opd_cfg.get("anchor_planner", "trace") != "trace"
+                or opd_cfg.get("loss", "e2e_tv") != "e2e_tv"
+                or training.get("dflash_per_position_loss_weight" if is_dflash else "dspark_per_position_loss_weight", "fixed_exp_decay") != "fixed_exp_decay"
+            ):
+                raise ValueError("Draft-OPD full replay requires trace + e2e_tv without VAT")
     if not enabled:
         clear_drafter_config_env()
         # V1 creates standalone rollout replicas even without speculative
@@ -4868,6 +4868,12 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     engine_kwargs = _ensure_nested_mapping(
         config, ("actor_rollout_ref", "rollout", "engine_kwargs", "vllm")
     )
+    if opd_cfg.get("enable", False) and opd_cfg.get("replay_full_suffix", False):
+        # Async scheduling keeps concrete proposals in the GPU worker and leaves
+        # -1 placeholders in scheduler output. Full replay needs the CPU IDs.
+        if engine_kwargs.get("async_scheduling") is True:
+            raise ValueError("Draft-OPD full replay requires vLLM async_scheduling=false to capture proposal IDs")
+        _set_child(engine_kwargs, "async_scheduling", False)
     additional_config = _get_nested(engine_kwargs, ("additional_config",), {}) or {}
     additional_config = dict(additional_config)
     # Keep private transport metadata out of platform additional_config: some
@@ -5374,6 +5380,9 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         # patch here so it is active before GPUModelRunner.load_model(); the
         # WorkerDict-side installer runs in a different process and is too
         # early only for the frontend, not for this model-worker process.
+        from verl_speco.integration.opd_vllm_tokens import patch_v2_draft_token_copy
+
+        patch_v2_draft_token_copy()
         patch_vllm_dspark_draft_load_config()
         try:
             instance = super().__new__(cls, **kwargs)

@@ -12,11 +12,12 @@ from verl_speco.integration.verify_trace import TRACE_KEY, validate_verify_trace
 
 
 @pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("full_replay", [False, True])
 @pytest.mark.parametrize("config_source", ["environment", "server_class"])
 @pytest.mark.parametrize("invalid_tokens", [None, {}, {"r": 1}])
 @pytest.mark.parametrize("layout", ["dflash", "dspark"])
 def test_scheduler_patch_transports_trace_on_finished_request(
-    monkeypatch, capture, config_source, invalid_tokens, layout
+    monkeypatch, capture, full_replay, config_source, invalid_tokens, layout
 ):
     request = SimpleNamespace(
         prompt_token_ids=[1, 2], _output_token_ids=[], is_finished=lambda: False
@@ -52,7 +53,7 @@ def test_scheduler_patch_transports_trace_on_finished_request(
     monkeypatch.setitem(sys.modules, processor_module.__name__, processor_module)
     config = {
         "speculative_algorithm": layout.upper(),
-        "training": {"drafter_opd": {"capture_verify_trace": capture}},
+        "training": {"drafter_opd": {"capture_verify_trace": capture, "replay_full_suffix": full_replay}},
     }
     monkeypatch.delenv(runtime.SPECO_DRAFTER_CONFIG_ENV, raising=False)
     monkeypatch.delenv("VERL_SPECO_SGLANG_DRAFTER_CONFIG", raising=False)
@@ -69,7 +70,7 @@ def test_scheduler_patch_transports_trace_on_finished_request(
     scheduler.requests = {"r": request}
     scheduled = SimpleNamespace(
         num_scheduled_tokens={"r": 3},
-        scheduled_spec_decode_tokens={"r": [-1] * (3 if invalid_tokens else 2)},
+        scheduled_spec_decode_tokens={"r": [3, 4] + ([-1] if invalid_tokens else [])},
         num_invalid_spec_tokens=invalid_tokens,
     )
     output = SimpleNamespace(req_id_to_index={"r": 0}, sampled_token_ids=[[3, 4, 5]])
@@ -84,6 +85,8 @@ def test_scheduler_patch_transports_trace_on_finished_request(
         assert trace["steps"][0]["accepted"] == 2
         assert trace["steps"][0]["commit"] == 2
         assert trace["steps"][0]["truncated"]
+        if full_replay:
+            assert trace["steps"][0]["draft_token_ids"] == [3, 4]
         fields = runtime._vllm_request_accept_stats_to_scalar_extra_fields(
             SimpleNamespace(
                 request_id="r", _speco_vllm_request_accept_stats={"r": summary}

@@ -786,6 +786,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
         # Anchors must point at a real context row (the hidden states may be one
         # row shorter than the label sequence when a trailing label token exists).
         if self.opd_objective is not None:
+            if self.opd_objective.full_replay:
+                anchor_positions, block_keep_mask = anchor_positions[:, :1], block_keep_mask[:, :1]
             anchor_positions, block_keep_mask, observed, visible, rejected = self.opd_objective.plan(
                 anchor_positions, block_keep_mask, opd_trace)
         block_keep_mask = block_keep_mask & (anchor_positions < seq_len)
@@ -1886,7 +1888,8 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 res["opd_trace"].append(preprocess_trace(
                     item, start=start, end=end, layout="dspark",
                     capacity=int(model_config.block_size), device=device,
-                    aligned_next_tokens=next_token_ids is not None))
+                    aligned_next_tokens=next_token_ids is not None,
+                    require_full_suffix=bool(opd_cfg.get("replay_full_suffix", False))))
             # ``ids`` / ``item_loss_mask`` carry the (optional) trailing label
             # token; the hidden context is one row shorter when it is present.
             hidden_end = max(start, min(end, int(full_h.size(0))))

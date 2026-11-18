@@ -251,7 +251,7 @@ def test_planner_has_fixed_budget_and_explicit_random_quota(planner, expected_ra
 
 def test_truncated_step_does_not_receive_false_first_reject_weight():
     objective = DraftOPDObjective(
-        {},
+        {"first_reject_weight": 2.0},
         layout="dspark",
         loss_mode="full_vocab",
         per_position_loss_weight="fixed_exp_decay",

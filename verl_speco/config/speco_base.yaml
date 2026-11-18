@@ -312,10 +312,15 @@ actor_rollout_ref:
         drafter_opd:
           enable: false
           capture_verify_trace: false
-          anchor_planner: mixed
+          # Actor teacher-forces full proposal branches; extra rows never enter PPO.
+          replay_full_suffix: false
+          # Uniformly sampled complete blocks per selected source trajectory; 0 = all.
+          replay_max_blocks_per_sample: 32
+          # Trace-only anchors; optional actor-scored full proposal replay above.
+          anchor_planner: trace
           random_anchor_ratio: 0.25
           loss: e2e_tv
-          first_reject_weight: 2.0
+          first_reject_weight: 1.0
           chunk_size: 1024
         vat:
           kd_weight: null

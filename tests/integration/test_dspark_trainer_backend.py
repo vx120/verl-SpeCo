@@ -2305,6 +2305,64 @@ def test_dspark_vat_acceptance_includes_markov_bias(draft_id, expected):
 
 
 @pytest.mark.parametrize("model_type", ["dflash", "dspark"])
+def test_opd_full_branch_replay_matches_dense_loss_and_gradient(model_type):
+    from verl_speco.backends.drafter_opd import preprocess_trace
+    from verl_speco.integration.verify_trace import TRACE_KEY
+
+    torch.manual_seed(97)
+    is_dflash = model_type == "dflash"
+    config_cls = DFlashConfig if is_dflash else DSparkConfig
+    draft_cls = DFlashDraftModel if is_dflash else DSparkDraftModel
+    training_cls = DFlashTrainingModel if is_dflash else DSparkTrainingModel
+    config = config_cls(
+        hidden_size=8, intermediate_size=16, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=1, vocab_size=32,
+        num_target_layers=4, num_context_layers=2, target_hidden_size=8,
+        target_num_hidden_layers=4, target_layer_ids=[1, 3],
+        mask_token_id=31, markov_rank=4, enable_confidence_head=True,
+    )
+    model = training_cls(
+        draft_cls(config), block_size=4 if is_dflash else 3, num_anchors=8,
+        drafter_opd_config={"enable": True, "replay_full_suffix": True},
+    )
+    trace = {
+        "kind": "draft_branch_replay", "layout": model_type, "num_spec_tokens": 3,
+        "prompt_length": 3, "response_length": 3, "anchor": 2, "accepted": 1,
+        "draft_token_ids": [4, 5, 8],
+    }
+    plan = preprocess_trace({TRACE_KEY: trace}, start=0, end=6, layout=model_type,
+                            capacity=3, device="cpu", require_full_suffix=True).unsqueeze(0)
+    captured = []
+    handle = model.draft_model.register_forward_hook(lambda module, inputs, output: captured.append(output))
+    head = torch.randn(32, 8)
+    teacher_hidden = torch.randn(1, 6, 8)
+    loss, *_rest, metrics = model(
+        input_ids=torch.tensor([[1, 2, 3, 4, 5, 8]]),
+        hidden_states_list=[torch.randn(1, 6, 8), torch.randn(1, 6, 8)],
+        loss_mask=torch.tensor([[0., 0., 0., 1., 1., 1.]]),
+        lm_head_weight=head, target_last_hidden_states=teacher_hidden, opd_trace=plan,
+    )
+    handle.remove()
+    hidden = captured[0].reshape(-1, 8)[1 if is_dflash else 0:]
+    assert hidden.shape == (3, 8)  # one real anchor, no padded 8-anchor forward
+    logits = hidden @ head.T
+    if not is_dflash:
+        logits = logits + model._markov_bias_for_active(
+            active_hidden=hidden, active_prev_tokens=torch.tensor([3, 4, 5]),
+            restricted_vocab=None,
+        )
+    tv = (logits.float().softmax(-1) - (teacher_hidden[0, 2:5] @ head.T).float().softmax(-1)).abs().sum(-1) / 2
+    expected = 1 - (1 - tv).cumprod(0).mean()
+    torch.testing.assert_close(loss, expected)
+    parameter = next(parameter for parameter in model.draft_model.parameters() if parameter.requires_grad)
+    torch.testing.assert_close(
+        torch.autograd.grad(loss, parameter, retain_graph=True)[0],
+        torch.autograd.grad(expected, parameter)[0],
+    )
+    assert metrics["opd/visible_tokens"] == 3
+
+
+@pytest.mark.parametrize("model_type", ["dflash", "dspark"])
 @pytest.mark.parametrize("loss_type", ["ce", "e2e_tv"])
 @pytest.mark.parametrize("vat,empty", [(False, False), (False, True), (True, False), (True, True)])
 def test_drafter_opd_backends_forward_backward(model_type, loss_type, vat, empty):

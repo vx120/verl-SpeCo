@@ -1,0 +1,142 @@
+--- a/verl_speco/integration/vllm_runtime.py
++++ b/verl_speco/integration/vllm_runtime.py
+@@ -3401,6 +3401,9 @@
+ 
+ 
+ def _speco_vllm_worker_main_with_runtime_observability(*args, **kwargs):
++    from verl_speco.integration.opd_vllm_tokens import patch_v2_draft_token_copy
++
++    patch_v2_draft_token_copy()
+     _maybe_apply_vllm_ascend_global_patch()
+     patch_vllm_dflash_config_aliases()
+     patch_vllm_dspark_registry_aliases()
+@@ -3424,8 +3427,7 @@
+ def patch_vllm_worker_proc_entrypoint() -> bool:
+     """Install runtime patches inside vLLM worker subprocesses."""
+ 
+-    if not _maybe_apply_vllm_ascend_global_patch():
+-        return False
++    _maybe_apply_vllm_ascend_global_patch()
+     try:
+         from vllm.v1.executor import multiproc_executor
+     except Exception as exc:  # noqa: BLE001
+@@ -3478,6 +3480,9 @@
+ 
+ def install_vllm_runtime_observability() -> bool:
+     """Install lightweight vLLM logging hooks for all rollout modes."""
++    from verl_speco.integration.opd_vllm_tokens import patch_v2_draft_token_copy
++
++    patch_v2_draft_token_copy()
+ 
+     _maybe_apply_vllm_ascend_global_patch()
+     dflash_config_patched = patch_vllm_dflash_config_aliases()
+@@ -4028,6 +4033,9 @@
+         return await super().launch_server(*args, **kwargs)
+ 
+     async def run_server(self, args):
++        from verl_speco.integration.opd_vllm_tokens import enforce_replay_engine_args
++
++        enforce_replay_engine_args(args)
+         try:
+             import inspect
+ 
+@@ -4662,6 +4670,9 @@
+         return await original_launch_server(self, *args, **kwargs)
+ 
+     async def run_server_with_speco_stats(self, args):
++        from verl_speco.integration.opd_vllm_tokens import enforce_replay_engine_args
++
++        enforce_replay_engine_args(args)
+         try:
+             from vllm.v1.engine.async_llm import AsyncLLM
+         except Exception:  # noqa: BLE001
+@@ -5369,6 +5380,9 @@
+         # patch here so it is active before GPUModelRunner.load_model(); the
+         # WorkerDict-side installer runs in a different process and is too
+         # early only for the frontend, not for this model-worker process.
++        from verl_speco.integration.opd_vllm_tokens import patch_v2_draft_token_copy
++
++        patch_v2_draft_token_copy()
+         patch_vllm_dspark_draft_load_config()
+         try:
+             instance = super().__new__(cls, **kwargs)
+--- a/verl_speco/integration/verify_trace.py
++++ b/verl_speco/integration/verify_trace.py
+@@ -25,11 +25,25 @@
+         drafts = len(scheduled.scheduled_spec_decode_tokens.get(rid, ()))
+         if scheduled.num_invalid_spec_tokens:
+             drafts -= scheduled.num_invalid_spec_tokens.get(rid, 0)
+-        snapshot = (rid, request, len(request._output_token_ids), drafts, generated)
++        tokens = None
+         if capture_draft_tokens and generated:
+             tokens = list(scheduled.scheduled_spec_decode_tokens.get(rid, ()))[:drafts]
++            admitted = any(
++                item.req_id == rid for item in getattr(scheduled, "scheduled_new_reqs", ())
++            )
++            # Scheduler.schedule pads newly admitted/resumed decode requests
++            # with -1 for uniform CUDA graphs. They have no actual proposal.
++            if admitted and generated == 1 and tokens and all(t == -1 for t in tokens):
++                drafts, tokens = 0, []
+             if any(not isinstance(token, int) or token < 0 for token in tokens):
+-                raise ValueError("Draft-OPD replay requires concrete valid draft token IDs")
++                raise ValueError(
++                    "Draft-OPD replay requires concrete valid draft token IDs; "
++                    f"request={rid!r}, generated={generated}, drafts={drafts}, "
++                    f"admitted={admitted}, tokens={tokens!r}. "
++                    "Check CUDA worker log for 'V2 real proposal CPU copy installed'."
++                )
++        snapshot = (rid, request, len(request._output_token_ids), drafts, generated)
++        if tokens is not None:
+             snapshot += (tokens,)
+         snapshots.append(snapshot)
+     return snapshots
+--- /dev/null
++++ b/verl_speco/integration/opd_vllm_tokens.py
+@@ -0,0 +1,47 @@
++import functools
++import json
++import logging
++from verl_speco.integration.drafter_config_env import get_drafter_config_env
++
++logger = logging.getLogger(__name__)
++
++def full_replay_enabled():
++    config = json.loads(get_drafter_config_env() or "{}")
++    opd = config.get("training", {}).get("drafter_opd", {})
++    return bool(config.get("enable") and opd.get("enable") and opd.get("replay_full_suffix"))
++
++def enforce_replay_engine_args(args):
++    if full_replay_enabled():
++        if getattr(args, "pipeline_parallel_size", 1) != 1:
++            raise ValueError("Draft-OPD full replay requires pipeline_parallel_size=1")
++        args.async_scheduling = False
++        logger.warning("[speco opd replay] forcing engine async_scheduling=False after CLI parsing")
++
++class _CopyRequiredBatch:
++    has_structured_output_reqs = True
++    def __init__(self, batch):
++        self._batch = batch
++    def __getattr__(self, name):
++        return getattr(self._batch, name)
++
++def patch_v2_draft_token_copy(handler_class=None):
++    if not full_replay_enabled():
++        return False
++    if handler_class is None:
++        try:
++            from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
++        except ImportError:
++            return False
++        handler_class = DraftTokensHandler
++    original = handler_class.set_draft_tokens
++    if getattr(original, "_speco_full_replay_copy", False):
++        return True
++    @functools.wraps(original)
++    def set_draft_tokens(self, input_batch, draft_tokens):
++        if full_replay_enabled() and not input_batch.has_structured_output_reqs:
++            input_batch = _CopyRequiredBatch(input_batch)
++        return original(self, input_batch, draft_tokens)
++    set_draft_tokens._speco_full_replay_copy = True
++    handler_class.set_draft_tokens = set_draft_tokens
++    logger.warning("[speco opd replay] V2 real proposal CPU copy installed")
++    return True
